@@ -46,15 +46,17 @@ pub const ImageInfoTool = struct {
         const path = parseStringField(args_json, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
-        // Open and read file
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
-            // Try as relative path
-            const f = std.fs.cwd().openFile(path, .{}) catch {
+        // Open file — try absolute path first, fall back to cwd-relative
+        const file = if (std.fs.path.isAbsolute(path))
+            std.fs.openFileAbsolute(path, .{}) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "File not found: {s} ({s})", .{ path, @errorName(err) });
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            }
+        else
+            std.fs.cwd().openFile(path, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "File not found: {s} ({s})", .{ path, @errorName(err) });
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
-            return executeWithFile(f, allocator, path);
-        };
         return executeWithFile(file, allocator, path);
     }
 

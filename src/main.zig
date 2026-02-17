@@ -693,6 +693,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
         .browser_enabled = config.browser.enabled,
+        .screenshot_enabled = true,
     }) catch &.{};
     defer if (tools.len > 0) allocator.free(tools);
 

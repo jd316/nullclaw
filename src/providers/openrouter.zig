@@ -21,7 +21,7 @@ pub const OpenRouterProvider = struct {
 
     const BASE_URL = "https://openrouter.ai/api/v1/chat/completions";
     const WARMUP_URL = "https://openrouter.ai/api/v1/auth/key";
-    const REFERER = "https://github.com/theonlyhennygod/nullclaw";
+    const REFERER = "https://github.com/nullclaw/nullclaw";
     const TITLE = "nullclaw";
 
     pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8) OpenRouterProvider {
