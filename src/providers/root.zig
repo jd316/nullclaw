@@ -85,6 +85,8 @@ pub const ChatResponse = struct {
     tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
     model: []const u8 = "",
+    /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
+    reasoning_content: ?[]const u8 = null,
 
     /// True when the LLM wants to invoke at least one tool.
     pub fn hasToolCalls(self: ChatResponse) bool {
@@ -548,6 +550,20 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
     // anthropic-custom: prefix
     if (std.mem.startsWith(u8, name, "anthropic-custom:")) return .anthropic_provider;
 
+    return .unknown;
+}
+
+/// Auto-detect provider kind from an API key prefix.
+pub fn detectProviderByApiKey(key: []const u8) ProviderKind {
+    if (key.len < 3) return .unknown;
+    if (std.mem.startsWith(u8, key, "sk-or-")) return .openrouter_provider;
+    if (std.mem.startsWith(u8, key, "sk-ant-")) return .anthropic_provider;
+    if (std.mem.startsWith(u8, key, "sk-")) return .openai_provider;
+    if (std.mem.startsWith(u8, key, "gsk_")) return .compatible_provider;
+    if (std.mem.startsWith(u8, key, "xai-")) return .compatible_provider;
+    if (std.mem.startsWith(u8, key, "pplx-")) return .compatible_provider;
+    if (std.mem.startsWith(u8, key, "AKIA")) return .compatible_provider;
+    if (std.mem.startsWith(u8, key, "AIza")) return .gemini_provider;
     return .unknown;
 }
 
@@ -1211,6 +1227,56 @@ test "eqlLowercase matches case-insensitively" {
     try std.testing.expect(eqlLowercase("api_key", "api_key"));
     try std.testing.expect(eqlLowercase("Api_Key", "api_key"));
     try std.testing.expect(!eqlLowercase("api_keys", "api_key")); // different length — won't match
+}
+
+test "ChatResponse reasoning_content defaults to null" {
+    const resp = ChatResponse{};
+    try std.testing.expect(resp.reasoning_content == null);
+}
+
+test "ChatResponse reasoning_content can be set" {
+    const resp = ChatResponse{ .reasoning_content = "Let me think..." };
+    try std.testing.expectEqualStrings("Let me think...", resp.reasoning_content.?);
+}
+
+test "detectProviderByApiKey openrouter" {
+    try std.testing.expect(detectProviderByApiKey("sk-or-v1-abc123") == .openrouter_provider);
+}
+
+test "detectProviderByApiKey anthropic" {
+    try std.testing.expect(detectProviderByApiKey("sk-ant-api03-abc123") == .anthropic_provider);
+}
+
+test "detectProviderByApiKey openai" {
+    try std.testing.expect(detectProviderByApiKey("sk-proj-abc123") == .openai_provider);
+}
+
+test "detectProviderByApiKey groq" {
+    try std.testing.expect(detectProviderByApiKey("gsk_abc123def456") == .compatible_provider);
+}
+
+test "detectProviderByApiKey xai" {
+    try std.testing.expect(detectProviderByApiKey("xai-abc123") == .compatible_provider);
+}
+
+test "detectProviderByApiKey perplexity" {
+    try std.testing.expect(detectProviderByApiKey("pplx-abc123") == .compatible_provider);
+}
+
+test "detectProviderByApiKey aws" {
+    try std.testing.expect(detectProviderByApiKey("AKIAIOSFODNN7EXAMPLE") == .compatible_provider);
+}
+
+test "detectProviderByApiKey gemini" {
+    try std.testing.expect(detectProviderByApiKey("AIzaSyAbc123") == .gemini_provider);
+}
+
+test "detectProviderByApiKey unknown" {
+    try std.testing.expect(detectProviderByApiKey("random-key") == .unknown);
+}
+
+test "detectProviderByApiKey short key" {
+    try std.testing.expect(detectProviderByApiKey("ab") == .unknown);
 }
 
 test {

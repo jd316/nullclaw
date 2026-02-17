@@ -55,6 +55,13 @@ pub fn runIfDue(config: HygieneConfig, mem: ?Memory) HygieneReport {
         report.purged_memory_archives = purgeOldArchives(config) catch 0;
     }
 
+    // Prune old conversation rows
+    if (config.conversation_retention_days > 0) {
+        if (mem) |m| {
+            report.pruned_conversation_rows = pruneConversationRows(std.heap.page_allocator, m, config.conversation_retention_days) catch 0;
+        }
+    }
+
     // Mark hygiene as completed
     if (mem) |m| {
         const now = std.time.timestamp();
@@ -162,6 +169,40 @@ fn purgeOldArchives(config: HygieneConfig) !u64 {
     return removed;
 }
 
+/// Prune conversation rows older than retention_days via the Memory interface.
+/// Searches for conversation-tagged entries and deletes those whose timestamp is old.
+pub fn pruneConversationRows(allocator: std.mem.Allocator, mem: Memory, retention_days: u32) !u64 {
+    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
+
+    // Search for conversation-tagged entries
+    const results = mem.search(allocator, "conversation", 1000) catch return 0;
+    if (results.len == 0) return 0;
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
+
+    var pruned: u64 = 0;
+    for (results) |entry| {
+        // Parse timestamp from entry key (format: "conv_<timestamp>_<id>")
+        const ts = parseConversationTimestamp(entry.key) orelse continue;
+        if (ts < cutoff_secs) {
+            _ = mem.forget(entry.key) catch continue;
+            pruned += 1;
+        }
+    }
+
+    return pruned;
+}
+
+/// Parse a unix timestamp from a conversation key like "conv_1234567890_abc".
+fn parseConversationTimestamp(key: []const u8) ?i64 {
+    if (!std.mem.startsWith(u8, key, "conv_")) return null;
+    const after_prefix = key[5..];
+    const underscore_pos = std.mem.indexOfScalar(u8, after_prefix, '_') orelse after_prefix.len;
+    return std.fmt.parseInt(i64, after_prefix[0..underscore_pos], 10) catch null;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 test "HygieneReport totalActions" {
@@ -202,4 +243,17 @@ test "runIfDue no memory first run" {
 test "shouldRunNow returns true with no memory" {
     const config = HygieneConfig{};
     try std.testing.expect(shouldRunNow(config, null));
+}
+
+test "parseConversationTimestamp valid key" {
+    const ts = parseConversationTimestamp("conv_1700000000_abc123");
+    try std.testing.expectEqual(@as(i64, 1700000000), ts.?);
+}
+
+test "parseConversationTimestamp invalid prefix" {
+    try std.testing.expect(parseConversationTimestamp("msg_1700000000_abc") == null);
+}
+
+test "parseConversationTimestamp no timestamp" {
+    try std.testing.expect(parseConversationTimestamp("conv_notanumber_abc") == null);
 }

@@ -15,7 +15,7 @@ const MAX_NICK_RETRIES: usize = 5;
 /// IRC service bot names to filter out.
 const SERVICE_BOTS = [_][]const u8{ "NickServ", "ChanServ", "BotServ", "MemoServ" };
 
-/// IRC channel over TLS.
+/// IRC channel with optional TLS support.
 /// Joins configured channels, forwards PRIVMSG messages.
 pub const IrcChannel = struct {
     allocator: std.mem.Allocator,
@@ -28,9 +28,31 @@ pub const IrcChannel = struct {
     server_password: ?[]const u8,
     nickserv_password: ?[]const u8,
     sasl_password: ?[]const u8,
-    verify_tls: bool,
-    use_tls: bool = true,
+    verify_tls: bool = true,
+    use_tls: bool = false,
     stream: ?std.net.Stream = null,
+    tls_state: ?*TlsState = null,
+
+    /// Heap-allocated TLS state that wraps a TCP stream with encryption.
+    /// Must be heap-allocated so that pointers remain stable for the TLS client.
+    pub const TlsState = struct {
+        stream_reader: std.net.Stream.Reader,
+        stream_writer: std.net.Stream.Writer,
+        tls_client: std.crypto.tls.Client,
+        /// Backing buffers owned by the allocator.
+        read_buf: []u8,
+        write_buf: []u8,
+        tls_read_buf: []u8,
+        tls_write_buf: []u8,
+
+        pub fn deinit(self: *TlsState, allocator: std.mem.Allocator) void {
+            allocator.free(self.read_buf);
+            allocator.free(self.write_buf);
+            allocator.free(self.tls_read_buf);
+            allocator.free(self.tls_write_buf);
+            allocator.destroy(self);
+        }
+    };
 
     /// Max IRC line length (RFC 2812).
     pub const MAX_LINE_LEN: usize = 512;
@@ -107,13 +129,28 @@ pub const IrcChannel = struct {
         return encodeSaslPlain(buf, nick, password);
     }
 
+    // ── I/O helpers ──────────────────────────────────────────────────
+
+    /// Write bytes through TLS or plain TCP depending on connection mode.
+    /// Abstracts away the write path so callers do not need to check use_tls.
+    pub fn ircWriteAll(self: *IrcChannel, data: []const u8) !void {
+        if (self.tls_state) |tls| {
+            try tls.tls_client.writer.writeAll(data);
+            try tls.tls_client.writer.flush();
+            // Flush the underlying stream writer to push ciphertext to the socket
+            try tls.stream_writer.interface.flush();
+        } else if (self.stream) |stream| {
+            try stream.writeAll(data);
+        } else {
+            return error.IrcNotConnected;
+        }
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to an IRC channel/user via PRIVMSG.
     /// Splits long messages respecting IRC's 512-byte line limit.
     pub fn sendMessage(self: *IrcChannel, target: []const u8, message: []const u8) !void {
-        const stream = self.stream orelse return error.IrcNotConnected;
-
         // Calculate max payload: 512 - prefix reserve - "PRIVMSG " - target - " :" - "\r\n"
         const overhead = SENDER_PREFIX_RESERVE + 10 + target.len + 2;
         const max_payload = if (MAX_LINE_LEN > overhead) MAX_LINE_LEN - overhead else 64;
@@ -129,30 +166,84 @@ pub const IrcChannel = struct {
             try lw.print("PRIVMSG {s} :{s}\r\n", .{ target, chunk });
             const line = line_fbs.getWritten();
 
-            try stream.writeAll(line);
+            try self.ircWriteAll(line);
         }
     }
 
     /// Send a raw IRC line (used for NICK, USER, PASS, JOIN, PONG, etc.).
     pub fn sendRaw(self: *IrcChannel, line: []const u8) !void {
-        const stream = self.stream orelse return error.IrcNotConnected;
-        try stream.writeAll(line);
-        try stream.writeAll("\r\n");
+        try self.ircWriteAll(line);
+        try self.ircWriteAll("\r\n");
     }
 
     /// Connect to the IRC server via TCP.
-    /// TODO: When use_tls is true, wrap the TCP stream with std.crypto.tls.Client
-    /// for TLS encryption. Currently connects via plain TCP regardless of use_tls.
+    /// When use_tls is true, wraps the TCP stream with std.crypto.tls.Client
+    /// for TLS encryption. Otherwise connects via plain TCP.
     pub fn connect(self: *IrcChannel) !void {
         const addr = try std.net.Address.resolveIp(self.server, self.port);
-        self.stream = try std.net.tcpConnectToAddress(addr);
+        const stream = try std.net.tcpConnectToAddress(addr);
+        self.stream = stream;
+
+        if (self.use_tls) {
+            try self.initTls(stream);
+        }
+    }
+
+    /// Initialize TLS over an existing TCP stream.
+    fn initTls(self: *IrcChannel, stream: std.net.Stream) !void {
+        const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
+
+        // Allocate buffers for stream and TLS I/O
+        const read_buf = try self.allocator.alloc(u8, tls_buf_len);
+        errdefer self.allocator.free(read_buf);
+        const write_buf = try self.allocator.alloc(u8, tls_buf_len);
+        errdefer self.allocator.free(write_buf);
+        const tls_read_buf = try self.allocator.alloc(u8, tls_buf_len);
+        errdefer self.allocator.free(tls_read_buf);
+        const tls_write_buf = try self.allocator.alloc(u8, tls_buf_len);
+        errdefer self.allocator.free(tls_write_buf);
+
+        // Heap-allocate TlsState so pointers remain stable
+        const tls = try self.allocator.create(TlsState);
+        errdefer self.allocator.destroy(tls);
+
+        tls.read_buf = read_buf;
+        tls.write_buf = write_buf;
+        tls.tls_read_buf = tls_read_buf;
+        tls.tls_write_buf = tls_write_buf;
+        tls.stream_reader = stream.reader(read_buf);
+        tls.stream_writer = stream.writer(write_buf);
+
+        tls.tls_client = std.crypto.tls.Client.init(
+            tls.stream_reader.interface(),
+            &tls.stream_writer.interface,
+            .{
+                .host = if (self.verify_tls) .{ .explicit = self.server } else .no_verification,
+                .ca = .no_verification,
+                .read_buffer = tls_read_buf,
+                .write_buffer = tls_write_buf,
+                .allow_truncation_attacks = true,
+            },
+        ) catch return error.TlsInitializationFailed;
+
+        self.tls_state = tls;
     }
 
     /// Disconnect from the IRC server.
     pub fn disconnect(self: *IrcChannel) void {
+        // Clean up TLS state first
+        if (self.tls_state) |tls| {
+            // Send TLS close_notify
+            tls.tls_client.end() catch {};
+            tls.deinit(self.allocator);
+            self.tls_state = null;
+        }
+
         if (self.stream) |stream| {
-            // Try to send QUIT gracefully
-            stream.writeAll("QUIT :nullclaw shutting down\r\n") catch {};
+            // Try to send QUIT gracefully (only for plain TCP; TLS already sent close_notify)
+            if (self.tls_state == null) {
+                stream.writeAll("QUIT :nullclaw shutting down\r\n") catch {};
+            }
             stream.close();
             self.stream = null;
         }
@@ -575,8 +666,8 @@ test "irc stores all fields" {
     try std.testing.expectEqualStrings("nspass", ch.nickserv_password.?);
     try std.testing.expectEqualStrings("saslpass", ch.sasl_password.?);
     try std.testing.expect(!ch.verify_tls);
-    // use_tls defaults to true
-    try std.testing.expect(ch.use_tls);
+    // use_tls defaults to false
+    try std.testing.expect(!ch.use_tls);
 }
 
 test "irc max line len constant" {
@@ -609,9 +700,9 @@ test "irc split long message" {
 // TLS, SASL, Nick Collision, Service Filtering, DM Routing Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "irc use_tls defaults to true" {
+test "irc use_tls defaults to false" {
     const ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
-    try std.testing.expect(ch.use_tls);
+    try std.testing.expect(!ch.use_tls);
 }
 
 test "irc sasl negotiation base64 encoding correct" {
@@ -690,4 +781,66 @@ test "irc style prefix exists" {
 
 test "irc max nick retries constant" {
     try std.testing.expectEqual(@as(usize, 5), MAX_NICK_RETRIES);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TLS Wrapping Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "irc tls config defaults" {
+    const ch = IrcChannel.init(std.testing.allocator, "irc.libera.chat", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    // use_tls defaults to false (plain TCP by default)
+    try std.testing.expect(!ch.use_tls);
+    // verify_tls uses the value passed to init
+    try std.testing.expect(ch.verify_tls);
+    // No TLS state or stream until connect() is called
+    try std.testing.expect(ch.tls_state == null);
+    try std.testing.expect(ch.stream == null);
+}
+
+test "irc tls disabled uses plain stream" {
+    var ch = IrcChannel.init(std.testing.allocator, "irc.test", 6667, "bot", null, &.{}, &.{}, null, null, null, false);
+    // use_tls is false by default — no TLS wrapping should occur
+    try std.testing.expect(!ch.use_tls);
+    try std.testing.expect(ch.tls_state == null);
+    // sendRaw without a connection should return IrcNotConnected
+    try std.testing.expectError(error.IrcNotConnected, ch.sendRaw("PING"));
+    // ircWriteAll without a connection should return IrcNotConnected
+    try std.testing.expectError(error.IrcNotConnected, ch.ircWriteAll("test"));
+}
+
+test "irc verify_tls field" {
+    // verify_tls=true (default when not overridden)
+    const ch1 = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    try std.testing.expect(ch1.verify_tls);
+
+    // verify_tls=false
+    const ch2 = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, false);
+    try std.testing.expect(!ch2.verify_tls);
+}
+
+test "irc ircWriteAll without connection returns error" {
+    var ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    // No stream, no TLS — should return IrcNotConnected
+    try std.testing.expect(ch.stream == null);
+    try std.testing.expect(ch.tls_state == null);
+    try std.testing.expectError(error.IrcNotConnected, ch.ircWriteAll("NICK bot\r\n"));
+}
+
+test "irc sendRaw without connection returns error" {
+    var ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    try std.testing.expectError(error.IrcNotConnected, ch.sendRaw("NICK bot"));
+}
+
+test "irc sendMessage without connection returns error" {
+    var ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    try std.testing.expectError(error.IrcNotConnected, ch.sendMessage("#test", "hello"));
+}
+
+test "irc disconnect without connection is safe" {
+    var ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    // Should not crash when called without an active connection
+    ch.disconnect();
+    try std.testing.expect(ch.stream == null);
+    try std.testing.expect(ch.tls_state == null);
 }

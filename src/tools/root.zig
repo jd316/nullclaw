@@ -36,6 +36,7 @@ pub const pushover = @import("pushover.zig");
 pub const schema = @import("schema.zig");
 pub const web_search = @import("web_search.zig");
 pub const web_fetch = @import("web_fetch.zig");
+pub const file_append = @import("file_append.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 

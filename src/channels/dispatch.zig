@@ -163,6 +163,83 @@ pub fn getEnabledChannelNames(registry: *const ChannelRegistry, allocator: Alloc
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Channel Supervisor
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Wraps a Channel with supervision state: restart counting, exponential
+/// backoff, and a circuit-breaker that gives up after `max_restarts`.
+pub const SupervisedChannel = struct {
+    channel: root.Channel,
+    state: State = .idle,
+    restart_count: u32 = 0,
+    max_restarts: u32 = 5,
+    backoff_ms: u64 = 1000,
+    max_backoff_ms: u64 = 60000,
+    backoff_factor: u64 = 2,
+
+    pub const State = enum {
+        idle,
+        running,
+        restarting,
+        gave_up,
+    };
+
+    /// Record a channel failure. Increments the restart counter, computes
+    /// exponential backoff, and transitions to `restarting` or `gave_up`.
+    pub fn recordFailure(self: *SupervisedChannel) void {
+        self.restart_count += 1;
+        if (self.restart_count >= self.max_restarts) {
+            self.state = .gave_up;
+        } else {
+            self.state = .restarting;
+        }
+        // Compute exponential backoff: initial * factor^(restart_count - 1)
+        var delay: u64 = self.backoff_ms;
+        var i: u32 = 1;
+        while (i < self.restart_count) : (i += 1) {
+            delay = @min(delay * self.backoff_factor, self.max_backoff_ms);
+        }
+        self.backoff_ms = @min(delay, self.max_backoff_ms);
+    }
+
+    /// Record a successful start / recovery. Resets restart count and
+    /// backoff to initial values, sets state to `running`.
+    pub fn recordSuccess(self: *SupervisedChannel) void {
+        self.restart_count = 0;
+        self.backoff_ms = 1000;
+        self.state = .running;
+    }
+
+    /// Returns the current backoff delay in milliseconds.
+    pub fn currentBackoffMs(self: *const SupervisedChannel) u64 {
+        return self.backoff_ms;
+    }
+
+    /// Returns true if the supervisor should attempt a restart (state is
+    /// `restarting`, not `gave_up`).
+    pub fn shouldRestart(self: *const SupervisedChannel) bool {
+        return self.state == .restarting;
+    }
+};
+
+/// Create a SupervisedChannel wrapping the given Channel.
+pub fn spawnSupervisedChannel(channel: root.Channel, max_restarts: u32) SupervisedChannel {
+    return .{
+        .channel = channel,
+        .max_restarts = max_restarts,
+    };
+}
+
+/// Wrap an array of Channels into heap-allocated SupervisedChannels.
+pub fn startAllSupervised(allocator: Allocator, channels: []const root.Channel) ![]SupervisedChannel {
+    const supervised = try allocator.alloc(SupervisedChannel, channels.len);
+    for (channels, 0..) |ch, i| {
+        supervised[i] = spawnSupervisedChannel(ch, 5);
+    }
+    return supervised;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -515,4 +592,94 @@ test "getEnabledChannelNames returns registered names" {
     try std.testing.expectEqual(@as(usize, 2), names.len);
     try std.testing.expectEqualStrings("telegram", names[0]);
     try std.testing.expectEqualStrings("discord", names[1]);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Channel Supervisor Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "supervised channel initial state" {
+    var mock = MockChannel{ .name_str = "test" };
+    const sc = spawnSupervisedChannel(mock.channel(), 5);
+    try std.testing.expectEqual(SupervisedChannel.State.idle, sc.state);
+    try std.testing.expectEqual(@as(u32, 0), sc.restart_count);
+    try std.testing.expectEqual(@as(u64, 1000), sc.currentBackoffMs());
+    try std.testing.expectEqual(@as(u32, 5), sc.max_restarts);
+    try std.testing.expect(!sc.shouldRestart());
+}
+
+test "supervised channel recordFailure increments and sets restarting" {
+    var mock = MockChannel{ .name_str = "test" };
+    var sc = spawnSupervisedChannel(mock.channel(), 5);
+
+    sc.recordFailure();
+    try std.testing.expectEqual(@as(u32, 1), sc.restart_count);
+    try std.testing.expectEqual(SupervisedChannel.State.restarting, sc.state);
+    try std.testing.expect(sc.shouldRestart());
+
+    sc.recordFailure();
+    try std.testing.expectEqual(@as(u32, 2), sc.restart_count);
+    try std.testing.expectEqual(SupervisedChannel.State.restarting, sc.state);
+    // Backoff should have doubled
+    try std.testing.expect(sc.currentBackoffMs() > 1000);
+}
+
+test "supervised channel backoff capped at max_backoff_ms" {
+    var mock = MockChannel{ .name_str = "test" };
+    var sc = spawnSupervisedChannel(mock.channel(), 100);
+    // Override to make the cap easy to test
+    sc.max_backoff_ms = 5000;
+
+    // Record many failures to push backoff beyond the cap
+    for (0..20) |_| {
+        sc.recordFailure();
+    }
+    try std.testing.expect(sc.currentBackoffMs() <= 5000);
+}
+
+test "supervised channel gave_up after max_restarts" {
+    var mock = MockChannel{ .name_str = "test" };
+    var sc = spawnSupervisedChannel(mock.channel(), 3);
+
+    sc.recordFailure(); // 1 — restarting
+    sc.recordFailure(); // 2 — restarting
+    sc.recordFailure(); // 3 — gave_up (restart_count == max_restarts)
+
+    try std.testing.expectEqual(SupervisedChannel.State.gave_up, sc.state);
+    try std.testing.expect(!sc.shouldRestart());
+    try std.testing.expectEqual(@as(u32, 3), sc.restart_count);
+}
+
+test "supervised channel recordSuccess resets state" {
+    var mock = MockChannel{ .name_str = "test" };
+    var sc = spawnSupervisedChannel(mock.channel(), 5);
+
+    // Fail a couple of times
+    sc.recordFailure();
+    sc.recordFailure();
+    try std.testing.expectEqual(@as(u32, 2), sc.restart_count);
+    try std.testing.expect(sc.currentBackoffMs() > 1000);
+
+    // Successful recovery
+    sc.recordSuccess();
+    try std.testing.expectEqual(SupervisedChannel.State.running, sc.state);
+    try std.testing.expectEqual(@as(u32, 0), sc.restart_count);
+    try std.testing.expectEqual(@as(u64, 1000), sc.currentBackoffMs());
+}
+
+test "startAllSupervised wraps channel array" {
+    const allocator = std.testing.allocator;
+
+    var mock1 = MockChannel{ .name_str = "telegram" };
+    var mock2 = MockChannel{ .name_str = "discord" };
+    const channels = [_]root.Channel{ mock1.channel(), mock2.channel() };
+
+    const supervised = try startAllSupervised(allocator, &channels);
+    defer allocator.free(supervised);
+
+    try std.testing.expectEqual(@as(usize, 2), supervised.len);
+    try std.testing.expectEqual(SupervisedChannel.State.idle, supervised[0].state);
+    try std.testing.expectEqual(SupervisedChannel.State.idle, supervised[1].state);
+    try std.testing.expectEqualStrings("telegram", supervised[0].channel.name());
+    try std.testing.expectEqualStrings("discord", supervised[1].channel.name());
 }

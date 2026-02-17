@@ -47,6 +47,15 @@ const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 /// Max characters in source transcript passed to the summarizer.
 const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
+/// Default token limit for context window (used by token-based compaction trigger).
+pub const DEFAULT_TOKEN_LIMIT: u64 = 128_000;
+
+/// Minimum history length before context exhaustion recovery is attempted.
+const CONTEXT_RECOVERY_MIN_HISTORY: usize = 6;
+
+/// Number of recent messages to keep during force compression.
+const CONTEXT_RECOVERY_KEEP: usize = 4;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -64,15 +73,19 @@ pub const Agent = struct {
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
+    token_limit: u64 = 0,
 
     /// Conversation history — owned, growable list.
-    history: std.ArrayListUnmanaged(OwnedMessage),
+    history: std.ArrayListUnmanaged(OwnedMessage) = .empty,
 
     /// Total tokens used across all turns.
-    total_tokens: u64,
+    total_tokens: u64 = 0,
 
     /// Whether the system prompt has been injected.
-    has_system_prompt: bool,
+    has_system_prompt: bool = false,
+
+    /// Whether compaction was performed during the last turn.
+    last_turn_compacted: bool = false,
 
     /// An owned copy of a ChatMessage, where content is heap-allocated.
     const OwnedMessage = struct {
@@ -120,9 +133,11 @@ pub const Agent = struct {
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
+            .token_limit = cfg.agent.token_limit,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
+            .last_turn_compacted = false,
         };
     }
 
@@ -164,16 +179,71 @@ pub const Agent = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    /// Auto-compact history when it exceeds max_history_messages.
-    /// Uses the LLM provider to summarize older messages, replacing them
-    /// with a single summary system message. Keeps system prompt + summary + recent N messages.
+    /// Estimate total tokens in conversation history using heuristic: (total_chars + 3) / 4.
+    pub fn tokenEstimate(self: *const Agent) u64 {
+        var total_chars: u64 = 0;
+        for (self.history.items) |*msg| {
+            total_chars += msg.content.len;
+        }
+        return (total_chars + 3) / 4;
+    }
+
+    /// Summarize a slice of history messages via the LLM provider.
+    /// Returns an owned summary string. Falls back to transcript truncation on error.
+    fn summarizeSlice(self: *Agent, start: usize, end: usize) ![]u8 {
+        const transcript = try self.buildCompactionTranscript(start, end);
+        defer self.allocator.free(transcript);
+
+        const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
+        const summarizer_user = try std.fmt.allocPrint(self.allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
+        defer self.allocator.free(summarizer_user);
+
+        var summary_messages: [2]ChatMessage = .{
+            .{ .role = .system, .content = summarizer_system },
+            .{ .role = .user, .content = summarizer_user },
+        };
+
+        const messages_slice = summary_messages[0..2];
+
+        const summary_resp = self.provider.chat(
+            self.allocator,
+            .{
+                .messages = messages_slice,
+                .model = self.model_name,
+                .temperature = 0.2,
+                .tools = null,
+            },
+            self.model_name,
+            0.2,
+        ) catch {
+            // Fallback: use a local truncation of the transcript
+            const max_len = @min(transcript.len, COMPACTION_MAX_SUMMARY_CHARS);
+            return try self.allocator.dupe(u8, transcript[0..max_len]);
+        };
+
+        const raw_summary = summary_resp.contentOrEmpty();
+        const max_len = @min(raw_summary.len, COMPACTION_MAX_SUMMARY_CHARS);
+        return try self.allocator.dupe(u8, raw_summary[0..max_len]);
+    }
+
+    /// Auto-compact history when it exceeds max_history_messages or when
+    /// estimated token usage exceeds 75% of the configured token limit.
+    /// For large histories (>10 messages to summarize), uses multi-part strategy:
+    /// splits into halves, summarizes each independently, then merges.
     /// Returns true if compaction was performed.
     pub fn autoCompactHistory(self: *Agent) !bool {
         const has_system = self.history.items.len > 0 and self.history.items[0].role == .system;
         const start: usize = if (has_system) 1 else 0;
         const non_system_count = self.history.items.len - start;
 
-        if (non_system_count <= self.max_history_messages) return false;
+        // Trigger on message count exceeding threshold
+        const count_trigger = non_system_count > self.max_history_messages;
+
+        // Trigger on token estimate exceeding 75% of token limit
+        const token_threshold = (self.token_limit * 3) / 4;
+        const token_trigger = self.token_limit > 0 and self.tokenEstimate() > token_threshold;
+
+        if (!count_trigger and !token_trigger) return false;
 
         const keep_recent = @min(COMPACTION_KEEP_RECENT, @as(u32, @intCast(non_system_count)));
         const compact_count = non_system_count - keep_recent;
@@ -181,44 +251,34 @@ pub const Agent = struct {
 
         const compact_end = start + compact_count;
 
-        // Build transcript of messages to compact
-        const transcript = try self.buildCompactionTranscript(start, compact_end);
-        defer self.allocator.free(transcript);
+        // Multi-part strategy: if >10 messages to summarize, split into halves
+        const summary = if (compact_count > 10) blk: {
+            const mid = start + compact_count / 2;
 
-        // Try to summarize using the LLM
-        const summary = blk: {
-            // Build a summarization request
-            const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
-            const summarizer_user = try std.fmt.allocPrint(self.allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
-            defer self.allocator.free(summarizer_user);
+            // Summarize first half
+            const summary_a = try self.summarizeSlice(start, mid);
+            defer self.allocator.free(summary_a);
 
-            var summary_messages: [2]ChatMessage = .{
-                .{ .role = .system, .content = summarizer_system },
-                .{ .role = .user, .content = summarizer_user },
-            };
+            // Summarize second half
+            const summary_b = try self.summarizeSlice(mid, compact_end);
+            defer self.allocator.free(summary_b);
 
-            const messages_slice = summary_messages[0..2];
-
-            const summary_resp = self.provider.chat(
+            // Merge the two summaries
+            const merged = try std.fmt.allocPrint(
                 self.allocator,
-                .{
-                    .messages = messages_slice,
-                    .model = self.model_name,
-                    .temperature = 0.2,
-                    .tools = null,
-                },
-                self.model_name,
-                0.2,
-            ) catch {
-                // Fallback: use a local truncation of the transcript
-                const max_len = @min(transcript.len, COMPACTION_MAX_SUMMARY_CHARS);
-                break :blk try self.allocator.dupe(u8, transcript[0..max_len]);
-            };
+                "Earlier context:\n{s}\n\nMore recent context:\n{s}",
+                .{ summary_a, summary_b },
+            );
 
-            const raw_summary = summary_resp.contentOrEmpty();
-            const max_len = @min(raw_summary.len, COMPACTION_MAX_SUMMARY_CHARS);
-            break :blk try self.allocator.dupe(u8, raw_summary[0..max_len]);
-        };
+            // Truncate if too long
+            if (merged.len > COMPACTION_MAX_SUMMARY_CHARS) {
+                const truncated = try self.allocator.dupe(u8, merged[0..COMPACTION_MAX_SUMMARY_CHARS]);
+                self.allocator.free(merged);
+                break :blk truncated;
+            }
+
+            break :blk merged;
+        } else try self.summarizeSlice(start, compact_end);
         defer self.allocator.free(summary);
 
         // Create the compaction summary message
@@ -241,6 +301,33 @@ pub const Agent = struct {
             std.mem.copyForwards(OwnedMessage, self.history.items[start + 1 ..], src);
             self.history.items.len -= (compact_end - start - 1);
         }
+
+        return true;
+    }
+
+    /// Force-compress history for context exhaustion recovery.
+    /// Keeps system prompt (if any) + last CONTEXT_RECOVERY_KEEP messages.
+    /// Everything in between is dropped without LLM summarization (we can't call
+    /// the LLM since the context is exhausted). Returns true if compression was performed.
+    pub fn forceCompressHistory(self: *Agent) bool {
+        const has_system = self.history.items.len > 0 and self.history.items[0].role == .system;
+        const start: usize = if (has_system) 1 else 0;
+        const non_system_count = self.history.items.len - start;
+
+        if (non_system_count <= CONTEXT_RECOVERY_KEEP) return false;
+
+        const keep_start = self.history.items.len - CONTEXT_RECOVERY_KEEP;
+        const to_remove = keep_start - start;
+
+        // Free messages being removed
+        for (self.history.items[start..keep_start]) |*msg| {
+            msg.deinit(self.allocator);
+        }
+
+        // Shift remaining elements
+        const src = self.history.items[keep_start..];
+        std.mem.copyForwards(OwnedMessage, self.history.items[start..], src);
+        self.history.items.len -= to_remove;
 
         return true;
     }
@@ -401,6 +488,23 @@ pub const Agent = struct {
                     self.model_name,
                     self.temperature,
                 ) catch |retry_err| {
+                    // Context exhaustion recovery: if we have enough history,
+                    // force-compress and retry once more
+                    if (self.history.items.len > CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
+                        const recovery_msgs = self.buildMessageSlice() catch return retry_err;
+                        defer self.allocator.free(recovery_msgs);
+                        break :retry_blk self.provider.chat(
+                            self.allocator,
+                            .{
+                                .messages = recovery_msgs,
+                                .model = self.model_name,
+                                .temperature = self.temperature,
+                                .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                            },
+                            self.model_name,
+                            self.temperature,
+                        ) catch return retry_err;
+                    }
                     return retry_err;
                 };
             };
@@ -493,7 +597,7 @@ pub const Agent = struct {
                 });
 
                 // Auto-compaction before hard trimming to preserve context
-                _ = self.autoCompactHistory() catch false;
+                self.last_turn_compacted = self.autoCompactHistory() catch false;
                 self.trimHistory();
 
                 // Auto-save assistant response
@@ -1554,4 +1658,156 @@ test "slash command with whitespace" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "/new") != null);
+}
+
+// ── Session Consolidation Enhancement Tests ─────────────────────
+
+test "tokenEstimate empty history" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // Empty history: (0 + 3) / 4 = 0
+    try std.testing.expectEqual(@as(u64, 0), agent.tokenEstimate());
+}
+
+test "tokenEstimate with messages" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // Add messages with known content lengths
+    // "hello" = 5 chars, "world" = 5 chars => total 10 chars => (10 + 3) / 4 = 3
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "world"),
+    });
+
+    try std.testing.expectEqual(@as(u64, 3), agent.tokenEstimate());
+}
+
+test "tokenEstimate heuristic accuracy" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // 400 chars should estimate ~100 tokens
+    const content = try allocator.alloc(u8, 400);
+    defer allocator.free(content);
+    @memset(content, 'a');
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, content),
+    });
+
+    // (400 + 3) / 4 = 100
+    try std.testing.expectEqual(@as(u64, 100), agent.tokenEstimate());
+}
+
+test "autoCompactHistory no-op below count and token thresholds" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.token_limit = DEFAULT_TOKEN_LIMIT;
+
+    // Add a few small messages — well below both thresholds
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+    });
+
+    const compacted = try agent.autoCompactHistory();
+    try std.testing.expect(!compacted);
+    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+}
+
+test "DEFAULT_TOKEN_LIMIT constant" {
+    try std.testing.expectEqual(@as(u64, 128_000), DEFAULT_TOKEN_LIMIT);
+}
+
+// ── Context Exhaustion Recovery Tests ────────────────────────────
+
+test "forceCompressHistory keeps system + last 4 messages" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // Add system prompt + 8 messages
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..8) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "msg-{d}", .{i}),
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 9), agent.historyLen());
+
+    const compressed = agent.forceCompressHistory();
+    try std.testing.expect(compressed);
+
+    // Should keep system + last 4
+    try std.testing.expectEqual(@as(usize, 5), agent.historyLen());
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expectEqualStrings("system prompt", agent.history.items[0].content);
+    try std.testing.expectEqualStrings("msg-4", agent.history.items[1].content);
+    try std.testing.expectEqualStrings("msg-7", agent.history.items[4].content);
+}
+
+test "forceCompressHistory without system prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    // Add 8 messages (no system prompt)
+    for (0..8) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "msg-{d}", .{i}),
+        });
+    }
+
+    const compressed = agent.forceCompressHistory();
+    try std.testing.expect(compressed);
+
+    // Should keep last 4
+    try std.testing.expectEqual(@as(usize, 4), agent.historyLen());
+    try std.testing.expectEqualStrings("msg-4", agent.history.items[0].content);
+    try std.testing.expectEqualStrings("msg-7", agent.history.items[3].content);
+}
+
+test "forceCompressHistory no-op when history is small" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "hello"),
+    });
+
+    const compressed = agent.forceCompressHistory();
+    try std.testing.expect(!compressed);
+    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+}
+
+test "CONTEXT_RECOVERY constants" {
+    try std.testing.expectEqual(@as(usize, 6), CONTEXT_RECOVERY_MIN_HISTORY);
+    try std.testing.expectEqual(@as(usize, 4), CONTEXT_RECOVERY_KEEP);
 }

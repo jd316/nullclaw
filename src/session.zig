@@ -29,6 +29,7 @@ pub const Session = struct {
     agent: Agent,
     created_at: i64,
     last_active: i64,
+    last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
     turn_count: u64,
     mutex: std.Thread.Mutex,
@@ -111,6 +112,7 @@ pub const SessionManager = struct {
             ),
             .created_at = std.time.timestamp(),
             .last_active = std.time.timestamp(),
+            .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
             .mutex = .{},
@@ -131,6 +133,11 @@ pub const SessionManager = struct {
         const response = try session.agent.turn(content);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
+
+        // Track consolidation timestamp
+        if (session.agent.last_turn_compacted) {
+            session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
+        }
 
         return response;
     }
@@ -568,4 +575,31 @@ test "concurrent processMessage different keys — no crash" {
 
     for (handles) |h| h.join();
     try testing.expectEqual(@as(usize, num_threads), sm.sessionCount());
+}
+
+// ---------------------------------------------------------------------------
+// 5. Session consolidation tests
+// ---------------------------------------------------------------------------
+
+test "session last_consolidated defaults to zero" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("test:consolidation");
+    try testing.expectEqual(@as(u64, 0), s.last_consolidated);
+}
+
+test "session initial state includes last_consolidated" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s = try sm.getOrCreate("test:fields");
+    try testing.expectEqual(@as(u64, 0), s.last_consolidated);
+    try testing.expectEqual(@as(u64, 0), s.turn_count);
+    try testing.expect(s.created_at > 0);
+    try testing.expect(s.last_active > 0);
 }

@@ -90,6 +90,7 @@ pub const AgentConfig = struct {
     max_history_messages: u32 = 50,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
+    token_limit: u64 = 128_000,
 };
 
 pub const ModelRouteConfig = struct {
@@ -2113,6 +2114,7 @@ test "agent config defaults" {
     try std.testing.expectEqual(@as(u32, 50), a.max_history_messages);
     try std.testing.expect(!a.parallel_tools);
     try std.testing.expectEqualStrings("auto", a.tool_dispatcher);
+    try std.testing.expectEqual(@as(u64, 128_000), a.token_limit);
 }
 
 test "agent config compact mode" {

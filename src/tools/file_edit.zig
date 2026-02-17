@@ -126,7 +126,7 @@ pub const FileEditTool = struct {
 };
 
 /// Check if a relative path is safe (no traversal, no absolute path).
-fn isPathSafe(path: []const u8) bool {
+pub fn isPathSafe(path: []const u8) bool {
     if (path.len > 0 and path[0] == '/') return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
     var iter = std.mem.splitScalar(u8, path, '/');
