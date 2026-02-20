@@ -17,7 +17,14 @@ pub fn extractHost(url: []const u8) ?[]const u8 {
     const host_component = uri.host orelse return null;
     const host = switch (host_component) {
         .raw => |h| h,
-        .percent_encoded => |h| h,
+        .percent_encoded => |h| {
+            // Percent-encoded hostnames are suspicious (e.g. %31%32%37.0.0.1
+            // to smuggle 127.0.0.1). Reject any host that actually contains a
+            // percent-escape; pass through those that the parser tagged as
+            // percent_encoded but contain no '%' (std.Uri does this sometimes).
+            if (std.mem.indexOfScalar(u8, h, '%') != null) return null;
+            return h;
+        },
     };
     if (host.len == 0) return null;
     if (host[0] == '[') {
@@ -300,6 +307,13 @@ test "extractHost parses unbracketed ipv6 authority with port" {
 
 test "extractHost rejects invalid bracketed authority" {
     try std.testing.expect(extractHost("http://[::1") == null);
+}
+
+test "extractHost rejects percent-encoded host bypass" {
+    // %31%32%37%2e%30%2e%30%2e%31 = 127.0.0.1
+    try std.testing.expect(extractHost("http://%31%32%37%2e%30%2e%30%2e%31/secret") == null);
+    // %6c%6f%63%61%6c%68%6f%73%74 = localhost
+    try std.testing.expect(extractHost("http://%6c%6f%63%61%6c%68%6f%73%74/admin") == null);
 }
 
 test "extractHost returns null for non-http scheme" {
