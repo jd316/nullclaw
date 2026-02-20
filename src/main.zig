@@ -93,8 +93,14 @@ pub fn main() !void {
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    var port: u16 = 3000;
-    var host: []const u8 = "127.0.0.1";
+    const cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+
+    // Config values are the baseline; CLI flags override them.
+    var port: u16 = cfg.gateway.port;
+    var host: []const u8 = cfg.gateway.host;
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -109,11 +115,6 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             host = sub_args[i];
         }
     }
-
-    _ = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
 
     try yc.gateway.run(allocator, host, port);
 }
@@ -121,8 +122,14 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // ── Daemon ───────────────────────────────────────────────────────
 
 fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    var port: u16 = 3000;
-    var host: []const u8 = "127.0.0.1";
+    const cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+
+    // Config values are the baseline; CLI flags override them.
+    var port: u16 = cfg.gateway.port;
+    var host: []const u8 = cfg.gateway.host;
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -137,11 +144,6 @@ fn runDaemon(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             host = sub_args[i];
         }
     }
-
-    const cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
 
     try yc.daemon.run(allocator, &cfg, host, port);
 }
@@ -654,11 +656,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
 
     const telegram_config = config.channels.telegram orelse {
         std.debug.print("Telegram not configured. Add to config.json:\n", .{});
-        std.debug.print("  \"channels\": {{ \"telegram\": {{ \"bot_token\": \"...\" }} }}\n", .{});
+        std.debug.print("  \"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
         std.process.exit(1);
     };
 
-    // Determine allowed users: --user CLI args override config allowed_users
+    // Determine allowed users: --user CLI args override config allow_from
     var user_list: std.ArrayList([]const u8) = .empty;
     defer user_list.deinit(allocator);
     {
@@ -673,10 +675,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const allowed: []const []const u8 = if (user_list.items.len > 0)
         user_list.items
     else
-        telegram_config.allowed_users;
+        telegram_config.allow_from;
 
-    if (config.api_key == null) {
-        std.debug.print("No API key in config. Add api_key to ~/.nullclaw/config.json\n", .{});
+    if (config.defaultProviderKey() == null) {
+        std.debug.print("No API key configured. Add to ~/.nullclaw/config.json:\n", .{});
+        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
     }
 
@@ -702,6 +705,20 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
     tg.proxy = telegram_config.proxy;
 
+    // Set up transcription — key comes from providers.{audio_media.provider}
+    const trans = config.audio_media;
+    const whisper_ptr: ?*yc.voice.WhisperTranscriber = if (config.getProviderKey(trans.provider)) |key| blk: {
+        const wt = try allocator.create(yc.voice.WhisperTranscriber);
+        wt.* = .{
+            .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
+            .api_key = key,
+            .model = trans.model,
+            .language = trans.language,
+        };
+        break :blk wt;
+    } else null;
+    if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
+
     // Initialize MCP tools from config
     const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
         yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
@@ -718,7 +735,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
-        .fallback_api_key = config.api_key,
+        .fallback_api_key = config.defaultProviderKey(),
         .tools_config = config.tools,
     }) catch &.{};
     defer if (tools.len > 0) allocator.free(tools);
@@ -751,18 +768,19 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         ollama: yc.providers.ollama.OllamaProvider,
     };
 
+    const api_key = config.defaultProviderKey();
     var holder: ProviderHolder = if (std.mem.eql(u8, config.default_provider, "anthropic"))
-        .{ .anthropic = yc.providers.anthropic.AnthropicProvider.init(allocator, config.api_key, null) }
+        .{ .anthropic = yc.providers.anthropic.AnthropicProvider.init(allocator, api_key, null) }
     else if (std.mem.eql(u8, config.default_provider, "openai"))
-        .{ .openai = yc.providers.openai.OpenAiProvider.init(allocator, config.api_key) }
+        .{ .openai = yc.providers.openai.OpenAiProvider.init(allocator, api_key) }
     else if (std.mem.eql(u8, config.default_provider, "gemini") or
         std.mem.eql(u8, config.default_provider, "google"))
-        .{ .gemini = yc.providers.gemini.GeminiProvider.init(allocator, config.api_key) }
+        .{ .gemini = yc.providers.gemini.GeminiProvider.init(allocator, api_key) }
     else if (std.mem.eql(u8, config.default_provider, "ollama"))
         .{ .ollama = yc.providers.ollama.OllamaProvider.init(allocator, null) }
     else
         // Default: OpenRouter (also handles all other provider names)
-        .{ .openrouter = yc.providers.openrouter.OpenRouterProvider.init(allocator, config.api_key) };
+        .{ .openrouter = yc.providers.openrouter.OpenRouterProvider.init(allocator, api_key) };
 
     const provider_i: yc.providers.Provider = switch (holder) {
         .openrouter => |*p| p.provider(),

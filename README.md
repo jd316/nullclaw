@@ -18,7 +18,7 @@
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
 ```
-678 KB binary · <2 ms startup · 2,738 tests · 22+ providers · 13 channels · Pluggable everything
+678 KB binary · <2 ms startup · 2,843 tests · 22+ providers · 13 channels · Pluggable everything
 ```
 
 ### Features
@@ -46,7 +46,7 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
 | **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **2,738** |
+| **Tests** | — | — | — | 1,017 | **2,843** |
 | **Source Files** | ~400+ | — | — | ~120 | **~110** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
@@ -180,12 +180,88 @@ nullclaw enforces security at **every layer**.
 
 Config: `~/.nullclaw/config.json` (created by `onboard`)
 
+> **OpenClaw compatible:** nullclaw uses the same config structure as [OpenClaw](https://github.com/openclaw/openclaw) (snake_case). Providers live under `models.providers`, the default model under `agents.defaults.model.primary`, and channels use `accounts` wrappers.
+
 ```json
 {
-  "api_key": "sk-...",
   "default_provider": "openrouter",
-  "default_model": "anthropic/claude-sonnet-4",
   "default_temperature": 0.7,
+
+  "models": {
+    "providers": {
+      "openrouter": { "api_key": "sk-or-..." },
+      "groq": { "api_key": "gsk_..." },
+      "anthropic": { "api_key": "sk-ant-...", "base_url": "https://api.anthropic.com" }
+    }
+  },
+
+  "agents": {
+    "defaults": {
+      "model": { "primary": "anthropic/claude-sonnet-4" },
+      "heartbeat": { "every": "30m" }
+    },
+    "list": [
+      { "id": "researcher", "model": { "primary": "anthropic/claude-opus-4" }, "system_prompt": "..." }
+    ]
+  },
+
+  "channels": {
+    "telegram": {
+      "accounts": {
+        "main": {
+          "bot_token": "123:ABC",
+          "allow_from": ["user1"],
+          "reply_in_private": true,
+          "proxy": "socks5://..."
+        }
+      }
+    },
+    "discord": {
+      "accounts": {
+        "main": {
+          "token": "disc-token",
+          "guild_id": "12345",
+          "allow_from": ["user1"],
+          "allow_bots": false
+        }
+      }
+    },
+    "irc": {
+      "accounts": {
+        "main": {
+          "host": "irc.libera.chat",
+          "port": 6697,
+          "nick": "nullclaw",
+          "channel": "#nullclaw",
+          "tls": true,
+          "allow_from": ["user1"]
+        }
+      }
+    },
+    "slack": {
+      "accounts": {
+        "main": {
+          "bot_token": "xoxb-...",
+          "app_token": "xapp-...",
+          "allow_from": ["user1"]
+        }
+      }
+    }
+  },
+
+  "tools": {
+    "media": {
+      "audio": {
+        "enabled": true,
+        "language": "ru",
+        "models": [{ "provider": "groq", "model": "whisper-large-v3" }]
+      }
+    }
+  },
+
+  "mcp_servers": {
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }
+  },
 
   "memory": {
     "backend": "sqlite",
@@ -218,28 +294,10 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
     }
   },
 
-  "heartbeat": {
-    "enabled": false,
-    "interval_minutes": 30
-  },
 
-  "tunnel": {
-    "provider": "none"
-  },
-
-  "secrets": {
-    "encrypt": true
-  },
-
-  "identity": {
-    "format": "openclaw"
-  },
-
-  "cost": {
-    "enabled": false,
-    "daily_limit_usd": 10.0,
-    "monthly_limit_usd": 100.0
-  },
+  "tunnel": { "provider": "none" },
+  "secrets": { "encrypt": true },
+  "identity": { "format": "openclaw" },
 
   "security": {
     "sandbox": { "backend": "auto" },
@@ -263,7 +321,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 | Command | Description |
 |---------|-------------|
-| `onboard` | Quick setup (default) |
+| `onboard --api-key sk-... --provider openrouter` | Quick setup with API key and provider |
 | `onboard --interactive` | Full interactive wizard |
 | `onboard --channels-only` | Reconfigure channels/allowlists only |
 | `agent -m "..."` | Single message mode |
@@ -278,14 +336,14 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 | `skills list\|install\|remove\|info` | Manage skill packs |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `models list\|info\|benchmark` | Model catalog |
-| `migrate openclaw` | Import from OpenClaw |
+| `migrate openclaw [--dry-run] [--source PATH]` | Import memory from OpenClaw workspace |
 
 ## Development
 
 ```bash
 zig build                          # Dev build
 zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 2,656 tests
+zig build test --summary all       # 2,843 tests
 ```
 
 ### Project Stats
@@ -294,7 +352,7 @@ zig build test --summary all       # 2,656 tests
 Language:     Zig 0.15
 Source files: ~110
 Lines of code: ~45,000
-Tests:        2,738
+Tests:        2,843
 Binary:       678 KB (ReleaseSmall)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)

@@ -8,7 +8,7 @@ pub const WhatsAppChannel = struct {
     access_token: []const u8,
     phone_number_id: []const u8,
     verify_token: []const u8,
-    allowed_numbers: []const []const u8,
+    allow_from: []const []const u8,
 
     pub const API_VERSION = "v18.0";
 
@@ -17,14 +17,14 @@ pub const WhatsAppChannel = struct {
         access_token: []const u8,
         phone_number_id: []const u8,
         verify_token: []const u8,
-        allowed_numbers: []const []const u8,
+        allow_from: []const []const u8,
     ) WhatsAppChannel {
         return .{
             .allocator = allocator,
             .access_token = access_token,
             .phone_number_id = phone_number_id,
             .verify_token = verify_token,
-            .allowed_numbers = allowed_numbers,
+            .allow_from = allow_from,
         };
     }
 
@@ -38,7 +38,7 @@ pub const WhatsAppChannel = struct {
 
     /// Check if a phone number is allowed (E.164 format: +1234567890).
     pub fn isNumberAllowed(self: *const WhatsAppChannel, phone: []const u8) bool {
-        return root.isAllowedExact(self.allowed_numbers, phone);
+        return root.isAllowedExact(self.allow_from, phone);
     }
 
     /// Normalize a phone number to E.164 (prepend + if missing).

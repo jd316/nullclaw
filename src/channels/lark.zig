@@ -14,7 +14,7 @@ pub const LarkChannel = struct {
     app_secret: []const u8,
     verification_token: []const u8,
     port: u16,
-    allowed_users: []const []const u8,
+    allow_from: []const []const u8,
     /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
     use_feishu: bool = true,
     /// Cached tenant access token (heap-allocated, owned by allocator).
@@ -31,7 +31,7 @@ pub const LarkChannel = struct {
         app_secret: []const u8,
         verification_token: []const u8,
         port: u16,
-        allowed_users: []const []const u8,
+        allow_from: []const []const u8,
     ) LarkChannel {
         return .{
             .allocator = allocator,
@@ -39,7 +39,7 @@ pub const LarkChannel = struct {
             .app_secret = app_secret,
             .verification_token = verification_token,
             .port = port,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
         };
     }
 
@@ -53,7 +53,7 @@ pub const LarkChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const LarkChannel, open_id: []const u8) bool {
-        return root.isAllowedExact(self.allowed_users, open_id);
+        return root.isAllowedExact(self.allow_from, open_id);
     }
 
     /// Parse a Lark event callback payload and extract text messages.
@@ -692,7 +692,7 @@ test "lark stores all fields" {
     try std.testing.expectEqualStrings("my_secret", ch.app_secret);
     try std.testing.expectEqualStrings("my_token", ch.verification_token);
     try std.testing.expectEqual(@as(u16, 8080), ch.port);
-    try std.testing.expectEqual(@as(usize, 2), ch.allowed_users.len);
+    try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

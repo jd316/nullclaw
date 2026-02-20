@@ -4,8 +4,10 @@
     .fingerprint = 0xe73e13d1c95956c2,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
-        // SQLite — C library, linked via build.zig
-        // No Zig package deps yet; we use stdlib + C interop
+        .sqlite3 = .{
+            .url = "git+https://github.com/allyourcodebase/sqlite3#8f840560eae88ab66668c6827c64ffbd0d74ef37",
+            .hash = "sqlite3-3.51.0-DMxLWssOAABZ8cAvU_LfBIbp0kZjm824PU8sSLXpEDdr",
+        },
     },
     .paths = .{
         "build.zig",

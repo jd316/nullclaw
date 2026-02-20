@@ -5,13 +5,13 @@ const root = @import("root.zig");
 /// Polls ~/Library/Messages/chat.db for new messages, sends via osascript.
 pub const IMessageChannel = struct {
     allocator: std.mem.Allocator,
-    allowed_contacts: []const []const u8,
+    allow_from: []const []const u8,
     poll_interval_secs: u64,
 
-    pub fn init(allocator: std.mem.Allocator, allowed_contacts: []const []const u8) IMessageChannel {
+    pub fn init(allocator: std.mem.Allocator, allow_from: []const []const u8) IMessageChannel {
         return .{
             .allocator = allocator,
-            .allowed_contacts = allowed_contacts,
+            .allow_from = allow_from,
             .poll_interval_secs = 3,
         };
     }
@@ -21,7 +21,7 @@ pub const IMessageChannel = struct {
     }
 
     pub fn isContactAllowed(self: *const IMessageChannel, sender: []const u8) bool {
-        return root.isAllowed(self.allowed_contacts, sender);
+        return root.isAllowed(self.allow_from, sender);
     }
 
     pub fn healthCheck(_: *IMessageChannel) bool {
@@ -283,13 +283,13 @@ test "invalid target injection attempt" {
 test "imessage creates with contacts" {
     const contacts = [_][]const u8{"+1234567890"};
     const ch = IMessageChannel.init(std.testing.allocator, &contacts);
-    try std.testing.expectEqual(@as(usize, 1), ch.allowed_contacts.len);
+    try std.testing.expectEqual(@as(usize, 1), ch.allow_from.len);
     try std.testing.expectEqual(@as(u64, 3), ch.poll_interval_secs);
 }
 
 test "imessage creates with empty contacts" {
     const ch = IMessageChannel.init(std.testing.allocator, &.{});
-    try std.testing.expectEqual(@as(usize, 0), ch.allowed_contacts.len);
+    try std.testing.expectEqual(@as(usize, 0), ch.allow_from.len);
 }
 
 test "imessage contact case insensitive" {

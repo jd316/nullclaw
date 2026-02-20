@@ -7,14 +7,14 @@ pub const MatrixChannel = struct {
     homeserver: []const u8,
     access_token: []const u8,
     room_id: []const u8,
-    allowed_users: []const []const u8,
+    allow_from: []const []const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
         homeserver: []const u8,
         access_token: []const u8,
         room_id: []const u8,
-        allowed_users: []const []const u8,
+        allow_from: []const []const u8,
     ) MatrixChannel {
         // Strip trailing slash from homeserver
         const hs = if (homeserver.len > 0 and homeserver[homeserver.len - 1] == '/')
@@ -27,7 +27,7 @@ pub const MatrixChannel = struct {
             .homeserver = hs,
             .access_token = access_token,
             .room_id = room_id,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
         };
     }
 
@@ -36,7 +36,7 @@ pub const MatrixChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const MatrixChannel, sender: []const u8) bool {
-        return root.isAllowed(self.allowed_users, sender);
+        return root.isAllowed(self.allow_from, sender);
     }
 
     pub fn healthCheck(_: *MatrixChannel) bool {
@@ -153,7 +153,7 @@ test "matrix creates with correct fields" {
     try std.testing.expectEqualStrings("https://matrix.org", ch.homeserver);
     try std.testing.expectEqualStrings("syt_test_token", ch.access_token);
     try std.testing.expectEqualStrings("!room:matrix.org", ch.room_id);
-    try std.testing.expectEqual(@as(usize, 1), ch.allowed_users.len);
+    try std.testing.expectEqual(@as(usize, 1), ch.allow_from.len);
 }
 
 test "matrix user case insensitive" {

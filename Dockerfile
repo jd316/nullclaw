@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM alpine:3.21 AS builder
+FROM alpine:3.23 AS builder
 
-RUN apk add --no-cache zig sqlite-dev musl-dev
+RUN apk add --no-cache zig musl-dev
 
 WORKDIR /app
-COPY build.zig build.zig.zon src/ src/
+COPY build.zig build.zig.zon ./
+COPY src/ src/
 
 RUN zig build -Doptimize=ReleaseSmall
 

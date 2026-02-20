@@ -28,9 +28,27 @@ pub const SandboxBackend = enum {
     none,
 };
 
+// ── Provider entry (for "providers" config section) ─────────────
+
+pub const ProviderEntry = struct {
+    name: []const u8,
+    api_key: ?[]const u8 = null,
+    base_url: ?[]const u8 = null,
+};
+
+// ── Audio media config (tools.media.audio) ─────────────────────
+
+pub const AudioMediaConfig = struct {
+    enabled: bool = true,
+    provider: []const u8 = "groq",
+    model: []const u8 = "whisper-large-v3",
+    base_url: ?[]const u8 = null,
+    language: ?[]const u8 = null,
+};
+
 // ── Sub-config structs ──────────────────────────────────────────
 
-pub const ObservabilityConfig = struct {
+pub const DiagnosticsConfig = struct {
     backend: []const u8 = "none",
     otel_endpoint: ?[]const u8 = null,
     otel_service_name: ?[]const u8 = null,
@@ -131,7 +149,7 @@ pub const CronConfig = struct {
 
 pub const TelegramConfig = struct {
     bot_token: []const u8,
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
     /// Use reply-to in private (1:1) chats. Groups always use reply-to.
     reply_in_private: bool = true,
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
@@ -139,10 +157,10 @@ pub const TelegramConfig = struct {
 };
 
 pub const DiscordConfig = struct {
-    bot_token: []const u8,
+    token: []const u8,
     guild_id: ?[]const u8 = null,
-    listen_to_bots: bool = false,
-    allowed_users: []const []const u8 = &.{},
+    allow_bots: bool = false,
+    allow_from: []const []const u8 = &.{},
     mention_only: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
@@ -151,7 +169,7 @@ pub const SlackConfig = struct {
     bot_token: []const u8,
     app_token: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
     dm_policy: []const u8 = "allow",
     group_policy: []const u8 = "mention_only",
 };
@@ -162,7 +180,7 @@ pub const WebhookConfig = struct {
 };
 
 pub const IMessageConfig = struct {
-    allowed_contacts: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
     enabled: bool = false,
 };
 
@@ -170,7 +188,7 @@ pub const MatrixConfig = struct {
     homeserver: []const u8,
     access_token: []const u8,
     room_id: []const u8,
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
 };
 
 pub const WhatsAppConfig = struct {
@@ -178,20 +196,20 @@ pub const WhatsAppConfig = struct {
     phone_number_id: []const u8,
     verify_token: []const u8,
     app_secret: ?[]const u8 = null,
-    allowed_numbers: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
 };
 
 pub const IrcConfig = struct {
-    server: []const u8,
+    host: []const u8,
     port: u16 = 6697,
-    nickname: []const u8,
+    nick: []const u8,
     username: ?[]const u8 = null,
     channels: []const []const u8 = &.{},
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
     server_password: ?[]const u8 = null,
     nickserv_password: ?[]const u8 = null,
     sasl_password: ?[]const u8 = null,
-    verify_tls: bool = true,
+    tls: bool = true,
 };
 
 pub const LarkReceiveMode = enum {
@@ -205,7 +223,7 @@ pub const LarkConfig = struct {
     encrypt_key: ?[]const u8 = null,
     verification_token: ?[]const u8 = null,
     use_feishu: bool = false,
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
     receive_mode: LarkReceiveMode = .websocket,
     port: ?u16 = null,
 };
@@ -213,7 +231,7 @@ pub const LarkConfig = struct {
 pub const DingTalkConfig = struct {
     client_id: []const u8,
     client_secret: []const u8,
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
 };
 
 pub const ChannelsConfig = struct {

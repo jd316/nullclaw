@@ -7,7 +7,7 @@ pub const DingTalkChannel = struct {
     allocator: std.mem.Allocator,
     client_id: []const u8,
     client_secret: []const u8,
-    allowed_users: []const []const u8,
+    allow_from: []const []const u8,
 
     pub const GATEWAY_URL = "https://api.dingtalk.com/v1.0/gateway/connections/open";
 
@@ -15,13 +15,13 @@ pub const DingTalkChannel = struct {
         allocator: std.mem.Allocator,
         client_id: []const u8,
         client_secret: []const u8,
-        allowed_users: []const []const u8,
+        allow_from: []const []const u8,
     ) DingTalkChannel {
         return .{
             .allocator = allocator,
             .client_id = client_id,
             .client_secret = client_secret,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
         };
     }
 
@@ -30,7 +30,7 @@ pub const DingTalkChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const DingTalkChannel, user_id: []const u8) bool {
-        return root.isAllowedExact(self.allowed_users, user_id);
+        return root.isAllowedExact(self.allow_from, user_id);
     }
 
     pub fn healthCheck(_: *DingTalkChannel) bool {

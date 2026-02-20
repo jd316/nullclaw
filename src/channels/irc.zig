@@ -21,16 +21,16 @@ const SERVICE_BOTS = [_][]const u8{ "NickServ", "ChanServ", "BotServ", "MemoServ
 /// Joins configured channels, forwards PRIVMSG messages.
 pub const IrcChannel = struct {
     allocator: std.mem.Allocator,
-    server: []const u8,
+    host: []const u8,
     port: u16,
-    nickname: []const u8,
+    nick: []const u8,
     username: []const u8,
     channels: []const []const u8,
-    allowed_users: []const []const u8,
+    allow_from: []const []const u8,
     server_password: ?[]const u8,
     nickserv_password: ?[]const u8,
     sasl_password: ?[]const u8,
-    verify_tls: bool = true,
+    tls: bool = true,
     use_tls: bool = false,
     stream: ?std.net.Stream = null,
     tls_state: ?*TlsState = null,
@@ -63,29 +63,29 @@ pub const IrcChannel = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        server: []const u8,
+        host: []const u8,
         port: u16,
-        nickname: []const u8,
+        nick_param: []const u8,
         username: ?[]const u8,
         channels: []const []const u8,
-        allowed_users: []const []const u8,
+        allow_from: []const []const u8,
         server_password: ?[]const u8,
         nickserv_password: ?[]const u8,
         sasl_password: ?[]const u8,
-        verify_tls: bool,
+        tls_verify: bool,
     ) IrcChannel {
         return .{
             .allocator = allocator,
-            .server = server,
+            .host = host,
             .port = port,
-            .nickname = nickname,
-            .username = username orelse nickname,
+            .nick = nick_param,
+            .username = username orelse nick_param,
             .channels = channels,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
             .server_password = server_password,
             .nickserv_password = nickserv_password,
             .sasl_password = sasl_password,
-            .verify_tls = verify_tls,
+            .tls = tls_verify,
         };
     }
 
@@ -94,7 +94,7 @@ pub const IrcChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const IrcChannel, nick: []const u8) bool {
-        return root.isAllowed(self.allowed_users, nick);
+        return root.isAllowed(self.allow_from, nick);
     }
 
     pub fn healthCheck(_: *IrcChannel) bool {
@@ -182,7 +182,7 @@ pub const IrcChannel = struct {
     /// When use_tls is true, wraps the TCP stream with std.crypto.tls.Client
     /// for TLS encryption. Otherwise connects via plain TCP.
     pub fn connect(self: *IrcChannel) !void {
-        const addr = try std.net.Address.resolveIp(self.server, self.port);
+        const addr = try std.net.Address.resolveIp(self.host, self.port);
         const stream = try std.net.tcpConnectToAddress(addr);
         self.stream = stream;
 
@@ -220,7 +220,7 @@ pub const IrcChannel = struct {
             tls.stream_reader.interface(),
             &tls.stream_writer.interface,
             .{
-                .host = if (self.verify_tls) .{ .explicit = self.server } else .no_verification,
+                .host = if (self.tls) .{ .explicit = self.host } else .no_verification,
                 .ca = .no_verification,
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
@@ -271,12 +271,12 @@ pub const IrcChannel = struct {
         // Send NICK and USER
         var nick_buf: [MAX_LINE_LEN]u8 = undefined;
         var nick_fbs = std.io.fixedBufferStream(&nick_buf);
-        try nick_fbs.writer().print("NICK {s}", .{self.nickname});
+        try nick_fbs.writer().print("NICK {s}", .{self.nick});
         try self.sendRaw(nick_fbs.getWritten());
 
         var user_buf: [MAX_LINE_LEN]u8 = undefined;
         var user_fbs = std.io.fixedBufferStream(&user_buf);
-        try user_fbs.writer().print("USER {s} 0 * :{s}", .{ self.username, self.nickname });
+        try user_fbs.writer().print("USER {s} 0 * :{s}", .{ self.username, self.nick });
         try self.sendRaw(user_fbs.getWritten());
 
         // Join configured channels
@@ -450,7 +450,7 @@ test "irc default username to nickname" {
 test "irc explicit username" {
     const ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "mybot", "customuser", &.{}, &.{}, null, null, null, true);
     try std.testing.expectEqualStrings("customuser", ch.username);
-    try std.testing.expectEqualStrings("mybot", ch.nickname);
+    try std.testing.expectEqualStrings("mybot", ch.nick);
 }
 
 test "irc parse privmsg" {
@@ -657,17 +657,17 @@ test "irc stores all fields" {
         "saslpass",
         false,
     );
-    try std.testing.expectEqualStrings("irc.example.com", ch.server);
+    try std.testing.expectEqualStrings("irc.example.com", ch.host);
     try std.testing.expectEqual(@as(u16, 6697), ch.port);
-    try std.testing.expectEqualStrings("zcbot", ch.nickname);
+    try std.testing.expectEqualStrings("zcbot", ch.nick);
     try std.testing.expectEqualStrings("zeroclaw", ch.username);
     try std.testing.expectEqual(@as(usize, 1), ch.channels.len);
     try std.testing.expectEqualStrings("#test", ch.channels[0]);
-    try std.testing.expectEqual(@as(usize, 1), ch.allowed_users.len);
+    try std.testing.expectEqual(@as(usize, 1), ch.allow_from.len);
     try std.testing.expectEqualStrings("serverpass", ch.server_password.?);
     try std.testing.expectEqualStrings("nspass", ch.nickserv_password.?);
     try std.testing.expectEqualStrings("saslpass", ch.sasl_password.?);
-    try std.testing.expect(!ch.verify_tls);
+    try std.testing.expect(!ch.tls);
     // use_tls defaults to false
     try std.testing.expect(!ch.use_tls);
 }
@@ -794,7 +794,7 @@ test "irc tls config defaults" {
     // use_tls defaults to false (plain TCP by default)
     try std.testing.expect(!ch.use_tls);
     // verify_tls uses the value passed to init
-    try std.testing.expect(ch.verify_tls);
+    try std.testing.expect(ch.tls);
     // No TLS state or stream until connect() is called
     try std.testing.expect(ch.tls_state == null);
     try std.testing.expect(ch.stream == null);
@@ -814,11 +814,11 @@ test "irc tls disabled uses plain stream" {
 test "irc verify_tls field" {
     // verify_tls=true (default when not overridden)
     const ch1 = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
-    try std.testing.expect(ch1.verify_tls);
+    try std.testing.expect(ch1.tls);
 
     // verify_tls=false
     const ch2 = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, false);
-    try std.testing.expect(!ch2.verify_tls);
+    try std.testing.expect(!ch2.tls);
 }
 
 test "irc ircWriteAll without connection returns error" {

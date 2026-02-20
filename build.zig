@@ -5,26 +5,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const sqlite_include: std.Build.LazyPath = .{
-        .cwd_relative = b.option(
-            []const u8,
-            "sqlite-include",
-            "Path to SQLite include directory (default: /opt/homebrew/opt/sqlite/include on macOS, /usr/include on Linux)",
-        ) orelse switch (builtin.os.tag) {
-            .macos => "/opt/homebrew/opt/sqlite/include",
-            else => "/usr/include",
-        },
-    };
-    const sqlite_lib: std.Build.LazyPath = .{
-        .cwd_relative = b.option(
-            []const u8,
-            "sqlite-lib",
-            "Path to SQLite lib directory (default: /opt/homebrew/opt/sqlite/lib on macOS, /usr/lib/x86_64-linux-gnu on Linux)",
-        ) orelse switch (builtin.os.tag) {
-            .macos => "/opt/homebrew/opt/sqlite/lib",
-            else => "/usr/lib/x86_64-linux-gnu",
-        },
-    };
+    const sqlite3_dep = b.dependency("sqlite3", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const sqlite3 = sqlite3_dep.artifact("sqlite3");
+    sqlite3.root_module.addCMacro("SQLITE_ENABLE_FTS5", "1");
 
     // ---------- library module (importable by consumers) ----------
     const lib_mod = b.addModule("nullclaw", .{
@@ -32,7 +18,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    lib_mod.addIncludePath(sqlite_include);
+    lib_mod.linkLibrary(sqlite3);
 
     // ---------- executable ----------
     const exe = b.addExecutable(.{
@@ -48,9 +34,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link SQLite on the compile step (not the module)
-    exe.root_module.addLibraryPath(sqlite_lib);
-    exe.linkSystemLibrary2("sqlite3", .{});
-    exe.linkLibC();
+    exe.linkLibrary(sqlite3);
     exe.dead_strip_dylibs = true;
 
     if (optimize != .Debug) {
@@ -79,9 +63,7 @@ pub fn build(b: *std.Build) void {
 
     // ---------- tests ----------
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
-    lib_tests.root_module.addLibraryPath(sqlite_lib);
-    lib_tests.linkSystemLibrary2("sqlite3", .{});
-    lib_tests.linkLibC();
+    lib_tests.linkLibrary(sqlite3);
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 

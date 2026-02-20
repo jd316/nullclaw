@@ -9,12 +9,12 @@ const log = std.log.scoped(.discord);
 /// Splits messages at 2000 chars (Discord limit).
 pub const DiscordChannel = struct {
     allocator: std.mem.Allocator,
-    bot_token: []const u8,
+    token: []const u8,
     guild_id: ?[]const u8,
-    listen_to_bots: bool,
+    allow_bots: bool,
 
     // Optional gateway fields (have defaults so existing init works)
-    allowed_users: []const []const u8 = &.{},
+    allow_from: []const []const u8 = &.{},
     mention_only: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
@@ -35,15 +35,15 @@ pub const DiscordChannel = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        bot_token: []const u8,
+        token: []const u8,
         guild_id: ?[]const u8,
-        listen_to_bots: bool,
+        allow_bots: bool,
     ) DiscordChannel {
         return .{
             .allocator = allocator,
-            .bot_token = bot_token,
+            .token = token,
             .guild_id = guild_id,
-            .listen_to_bots = listen_to_bots,
+            .allow_bots = allow_bots,
         };
     }
 
@@ -184,7 +184,7 @@ pub const DiscordChannel = struct {
         // Build auth header value: "Authorization: Bot <token>"
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.bot_token});
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
@@ -619,7 +619,7 @@ pub const DiscordChannel = struct {
         } else false;
 
         // Filter 1: bot author
-        if (author_is_bot and !self.listen_to_bots) {
+        if (author_is_bot and !self.allow_bots) {
             return;
         }
 
@@ -631,9 +631,9 @@ pub const DiscordChannel = struct {
             }
         }
 
-        // Filter 3: allowed_users allowlist
-        if (self.allowed_users.len > 0) {
-            if (!root.isAllowed(self.allowed_users, author_id)) {
+        // Filter 3: allow_from allowlist
+        if (self.allow_from.len > 0) {
+            if (!root.isAllowed(self.allow_from, author_id)) {
                 return;
             }
         }
@@ -667,7 +667,7 @@ pub const DiscordChannel = struct {
     /// Send IDENTIFY payload.
     fn sendIdentifyPayload(self: *DiscordChannel, ws: *websocket.WsClient) !void {
         var buf: [1024]u8 = undefined;
-        const json = try buildIdentifyJson(&buf, self.bot_token, self.intents);
+        const json = try buildIdentifyJson(&buf, self.token, self.intents);
         try ws.writeText(json);
     }
 
@@ -676,7 +676,7 @@ pub const DiscordChannel = struct {
         const sid = self.session_id orelse return error.NoSessionId;
         const seq = self.sequence.load(.acquire);
         var buf: [512]u8 = undefined;
-        const json = try buildResumeJson(&buf, self.bot_token, sid, seq);
+        const json = try buildResumeJson(&buf, self.token, sid, seq);
         try ws.writeText(json);
     }
 };
@@ -741,15 +741,15 @@ test "discord gateway url constant" {
 
 test "discord init stores fields" {
     const ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", "guild-123", true);
-    try std.testing.expectEqualStrings("my-bot-token", ch.bot_token);
+    try std.testing.expectEqualStrings("my-bot-token", ch.token);
     try std.testing.expectEqualStrings("guild-123", ch.guild_id.?);
-    try std.testing.expect(ch.listen_to_bots);
+    try std.testing.expect(ch.allow_bots);
 }
 
 test "discord init no guild id" {
     const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
     try std.testing.expect(ch.guild_id == null);
-    try std.testing.expect(!ch.listen_to_bots);
+    try std.testing.expect(!ch.allow_bots);
 }
 
 test "discord send url buffer too small returns error" {

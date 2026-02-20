@@ -9,7 +9,7 @@ pub const SlackChannel = struct {
     bot_token: []const u8,
     app_token: ?[]const u8,
     channel_id: ?[]const u8,
-    allowed_users: []const []const u8,
+    allow_from: []const []const u8,
     last_ts: []const u8,
     thread_ts: ?[]const u8 = null,
     policy: root.ChannelPolicy = .{},
@@ -21,14 +21,14 @@ pub const SlackChannel = struct {
         bot_token: []const u8,
         app_token: ?[]const u8,
         channel_id: ?[]const u8,
-        allowed_users: []const []const u8,
+        allow_from: []const []const u8,
     ) SlackChannel {
         return .{
             .allocator = allocator,
             .bot_token = bot_token,
             .app_token = app_token,
             .channel_id = channel_id,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
             .last_ts = "0",
         };
     }
@@ -38,7 +38,7 @@ pub const SlackChannel = struct {
         bot_token: []const u8,
         app_token: ?[]const u8,
         channel_id: ?[]const u8,
-        allowed_users: []const []const u8,
+        allow_from: []const []const u8,
         policy: root.ChannelPolicy,
     ) SlackChannel {
         return .{
@@ -46,7 +46,7 @@ pub const SlackChannel = struct {
             .bot_token = bot_token,
             .app_token = app_token,
             .channel_id = channel_id,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
             .last_ts = "0",
             .policy = policy,
         };
@@ -72,7 +72,7 @@ pub const SlackChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const SlackChannel, sender: []const u8) bool {
-        return root.isAllowed(self.allowed_users, sender);
+        return root.isAllowed(self.allow_from, sender);
     }
 
     /// Check if an incoming message should be handled based on the channel policy.

@@ -37,8 +37,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
     });
     try w.print("\n", .{});
 
-    // Observability
-    try w.print("Observability: {s}\n", .{cfg.observability.backend});
+    // Diagnostics
+    try w.print("Diagnostics:   {s}\n", .{cfg.diagnostics.backend});
 
     // Runtime
     try w.print("Runtime:     {s}\n", .{cfg.runtime.kind});

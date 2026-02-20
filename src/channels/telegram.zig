@@ -223,17 +223,18 @@ pub const SmartSplitIterator = struct {
 pub const TelegramChannel = struct {
     allocator: std.mem.Allocator,
     bot_token: []const u8,
-    allowed_users: []const []const u8,
+    allow_from: []const []const u8,
+    transcriber: ?voice.Transcriber = null,
     last_update_id: i64,
     proxy: ?[]const u8,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
 
-    pub fn init(allocator: std.mem.Allocator, bot_token: []const u8, allowed_users: []const []const u8) TelegramChannel {
+    pub fn init(allocator: std.mem.Allocator, bot_token: []const u8, allow_from: []const []const u8) TelegramChannel {
         return .{
             .allocator = allocator,
             .bot_token = bot_token,
-            .allowed_users = allowed_users,
+            .allow_from = allow_from,
             .last_update_id = 0,
             .proxy = null,
         };
@@ -264,7 +265,7 @@ pub const TelegramChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const TelegramChannel, sender: []const u8) bool {
-        for (self.allowed_users) |a| {
+        for (self.allow_from) |a| {
             if (std.mem.eql(u8, a, "*")) return true;
             // Strip leading "@" from allowlist entry (PicoClaw compat)
             const trimmed = if (a.len > 1 and a[0] == '@') a[1..] else a;
@@ -593,7 +594,7 @@ pub const TelegramChannel = struct {
     /// Poll for updates using long-polling (getUpdates) via curl.
     /// Returns a slice of ChannelMessages allocated on the given allocator.
     /// Voice and audio messages are automatically transcribed via Groq Whisper
-    /// when GROQ_API_KEY is set.
+    /// when a Groq API key is configured (config or GROQ_API_KEY env var).
     pub fn pollUpdates(self: *TelegramChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, "getUpdates");
@@ -692,7 +693,7 @@ pub const TelegramChannel = struct {
                     const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
                     const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
 
-                    if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id)) |transcribed| {
+                    if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber)) |transcribed| {
                         // Prepend [Voice]: prefix
                         var result: std.ArrayListUnmanaged(u8) = .empty;
                         result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
@@ -1084,7 +1085,13 @@ test "telegram init stores fields" {
     const ch = TelegramChannel.init(std.testing.allocator, "123:ABC-DEF", &users);
     try std.testing.expectEqualStrings("123:ABC-DEF", ch.bot_token);
     try std.testing.expectEqual(@as(i64, 0), ch.last_update_id);
-    try std.testing.expectEqual(@as(usize, 2), ch.allowed_users.len);
+    try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
+    try std.testing.expect(ch.transcriber == null);
+}
+
+test "telegram init has null transcriber" {
+    const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
+    try std.testing.expect(ch.transcriber == null);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1318,13 +1325,13 @@ test "telegram sendTypingIndicator does not crash with invalid token" {
 // Allowed Users Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "telegram allowed_users empty denies all" {
+test "telegram allow_from empty denies all" {
     const ch = TelegramChannel.init(std.testing.allocator, "tok", &.{});
     try std.testing.expect(!ch.isUserAllowed("anyone"));
     try std.testing.expect(!ch.isUserAllowed("admin"));
 }
 
-test "telegram allowed_users non-empty filters correctly" {
+test "telegram allow_from non-empty filters correctly" {
     const users = [_][]const u8{ "alice", "bob" };
     const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
     try std.testing.expect(ch.isUserAllowed("alice"));
@@ -1333,14 +1340,14 @@ test "telegram allowed_users non-empty filters correctly" {
     try std.testing.expect(!ch.isUserAllowed(""));
 }
 
-test "telegram allowed_users wildcard allows all" {
+test "telegram allow_from wildcard allows all" {
     const users = [_][]const u8{"*"};
     const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
     try std.testing.expect(ch.isUserAllowed("anyone"));
     try std.testing.expect(ch.isUserAllowed("admin"));
 }
 
-test "telegram allowed_users case insensitive" {
+test "telegram allow_from case insensitive" {
     const users = [_][]const u8{"Alice"};
     const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
     try std.testing.expect(ch.isUserAllowed("Alice"));
@@ -1348,7 +1355,7 @@ test "telegram allowed_users case insensitive" {
     try std.testing.expect(ch.isUserAllowed("ALICE"));
 }
 
-test "telegram allowed_users strips @ prefix" {
+test "telegram allow_from strips @ prefix" {
     const users = [_][]const u8{"@alice"};
     const ch = TelegramChannel.init(std.testing.allocator, "tok", &users);
     try std.testing.expect(ch.isUserAllowed("alice"));
