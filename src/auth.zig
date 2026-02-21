@@ -347,6 +347,7 @@ pub fn refreshAccessToken(
     defer allocator.free(payload);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
     const result = try client.fetch(.{
         .location = .{ .url = token_url },
         .method = .POST,
@@ -360,7 +361,6 @@ pub fn refreshAccessToken(
     if (result.status != .ok) return error.TokenRefreshFailed;
 
     const resp_body = aw.writer.buffer[0..aw.writer.end];
-    defer allocator.free(resp_body);
 
     var token = try parseTokenResponse(allocator, resp_body);
 
@@ -475,6 +475,7 @@ pub fn startDeviceCodeFlow(
     defer allocator.free(payload);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
     const result = try client.fetch(.{
         .location = .{ .url = device_auth_url },
         .method = .POST,
@@ -488,7 +489,6 @@ pub fn startDeviceCodeFlow(
     if (result.status != .ok) return error.DeviceCodeRequestFailed;
 
     const resp_body = aw.writer.buffer[0..aw.writer.end];
-    defer allocator.free(resp_body);
 
     return parseDeviceCodeResponse(allocator, resp_body);
 }
@@ -568,6 +568,7 @@ pub fn pollDeviceCode(
         std.Thread.sleep(interval_ns);
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
         const result = client.fetch(.{
             .location = .{ .url = token_url },
             .method = .POST,
@@ -580,7 +581,6 @@ pub fn pollDeviceCode(
         }) catch continue;
 
         const resp_body = aw.writer.buffer[0..aw.writer.end];
-        defer allocator.free(resp_body);
 
         if (result.status == .ok) {
             return parseTokenResponse(allocator, resp_body) catch continue;
@@ -836,4 +836,56 @@ test "parseTokenResponse handles missing refresh_token in response" {
 
     try std.testing.expectEqualStrings("refreshed_access", token.access_token);
     try std.testing.expect(token.refresh_token == null);
+}
+
+test "Allocating writer deinit frees full buffer — no invalid free on sub-slice (issue #42)" {
+    const allocator = std.testing.allocator;
+
+    // Simulate the pattern from refreshAccessToken / pollDeviceCode:
+    // Io.Writer.Allocating grows geometrically, so capacity > written length.
+    // The old code did allocator.free(buffer[0..end]) — a sub-slice free
+    // that is UB (length mismatch). The fix uses aw.deinit() instead.
+    {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+
+        try aw.writer.writeAll(
+            \\{"access_token":"test_tok","refresh_token":"test_rt","expires_in":7200,"token_type":"Bearer"}
+        );
+
+        // Confirm geometric growth: capacity > written
+        try std.testing.expect(aw.writer.buffer.len > aw.writer.end);
+
+        const resp_body = aw.writer.buffer[0..aw.writer.end];
+        const token = try parseTokenResponse(allocator, resp_body);
+        defer token.deinit(allocator);
+
+        try std.testing.expectEqualStrings("test_tok", token.access_token);
+        try std.testing.expectEqualStrings("test_rt", token.refresh_token.?);
+        try std.testing.expectEqualStrings("Bearer", token.token_type);
+    }
+
+    // Same pattern for parseDeviceCodeResponse (startDeviceCodeFlow path)
+    {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+
+        try aw.writer.writeAll(
+            \\{"device_code":"dev123","user_code":"ABCD-1234","verification_uri":"https://example.com/verify","interval":5,"expires_in":900}
+        );
+
+        try std.testing.expect(aw.writer.buffer.len > aw.writer.end);
+
+        const resp_body = aw.writer.buffer[0..aw.writer.end];
+        const dc = try parseDeviceCodeResponse(allocator, resp_body);
+        defer dc.deinit(allocator);
+
+        try std.testing.expectEqualStrings("dev123", dc.device_code);
+        try std.testing.expectEqualStrings("ABCD-1234", dc.user_code);
+        try std.testing.expectEqualStrings("https://example.com/verify", dc.verification_uri);
+        try std.testing.expectEqual(@as(u32, 5), dc.interval);
+    }
+    // If we reach here without panic, DebugAllocator confirmed:
+    // 1. No invalid free (sub-slice length mismatch)
+    // 2. No memory leak (all allocations freed)
 }
