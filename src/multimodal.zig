@@ -172,17 +172,17 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
     if (!allowed) return error.PathNotAllowed;
 
     const file = std.fs.openFileAbsolute(resolved, .{}) catch return error.PathNotFound;
-    return readFromFile(allocator, file);
+    return readFromFile(allocator, file, config.max_image_size_bytes);
 }
 
-fn readFromFile(allocator: std.mem.Allocator, file: std.fs.File) !ImageData {
+fn readFromFile(allocator: std.mem.Allocator, file: std.fs.File, max_size: u64) !ImageData {
     defer file.close();
 
     const stat = try file.stat();
-    if (stat.size > default_config.max_image_size_bytes)
+    if (stat.size > max_size)
         return error.ImageTooLarge;
 
-    const data = try file.readToEndAlloc(allocator, default_config.max_image_size_bytes);
+    const data = try file.readToEndAlloc(allocator, max_size);
     errdefer allocator.free(data);
 
     const mime = detectMimeType(data) orelse return error.UnknownImageFormat;

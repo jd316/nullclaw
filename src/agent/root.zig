@@ -322,7 +322,9 @@ pub const Agent = struct {
                 const tmp_dir = platform.getTempDir(arena) catch null;
                 const allowed: []const []const u8 = if (tmp_dir) |td| blk2: {
                     const dirs = try arena.alloc([]const u8, 1);
-                    dirs[0] = td;
+                    // Strip trailing separator so pathStartsWith works correctly
+                    // (TMPDIR on macOS ends with '/')
+                    dirs[0] = std.mem.trimRight(u8, td, "/\\");
                     break :blk2 dirs;
                 } else &.{};
                 break :blk try multimodal.prepareMessagesForProvider(arena, m, .{
@@ -788,22 +790,15 @@ pub const Agent = struct {
         };
     }
 
-    /// Build a flat ChatMessage slice from owned history, with multimodal processing.
+    /// Build a flat ChatMessage slice from owned history.
+    /// Recovery paths intentionally skip multimodal processing — images were
+    /// already encoded on the main path and temp files may be deleted.
     fn buildMessageSlice(self: *Agent) ![]ChatMessage {
-        var tmp_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer tmp_arena.deinit();
-        const arena = tmp_arena.allocator();
-
-        const raw = try arena.alloc(ChatMessage, self.history.items.len);
+        const messages = try self.allocator.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
-            raw[i] = msg.toChatMessage();
+            messages[i] = msg.toChatMessage();
         }
-        // Apply multimodal processing; fall back to raw messages on failure
-        const processed = multimodal.prepareMessagesForProvider(arena, raw, .{}) catch raw;
-        // Dupe onto self.allocator so the result outlives the tmp arena
-        const result = try self.allocator.alloc(ChatMessage, processed.len);
-        @memcpy(result, processed);
-        return result;
+        return messages;
     }
 
     /// Free heap-allocated fields of a ChatResponse.
