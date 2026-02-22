@@ -272,6 +272,7 @@ pub const OpenRouterProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_vision = supportsVisionImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .warmup = warmupImpl,
@@ -340,6 +341,10 @@ pub const OpenRouterProvider = struct {
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsVisionImpl(_: *anyopaque) bool {
         return true;
     }
 

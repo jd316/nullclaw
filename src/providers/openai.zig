@@ -163,6 +163,7 @@ pub const OpenAiProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_vision = supportsVisionImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
@@ -240,6 +241,10 @@ pub const OpenAiProvider = struct {
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsVisionImpl(_: *anyopaque) bool {
         return true;
     }
 

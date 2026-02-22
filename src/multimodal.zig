@@ -22,6 +22,9 @@ const log = std.log.scoped(.multimodal);
 pub const MultimodalConfig = struct {
     max_images: u32 = 4,
     max_image_size_bytes: u64 = 5_242_880, // 5 MB
+    /// Allow passing remote image URLs (`https://...`) through to providers.
+    /// Disabled by default for secure-by-default behavior.
+    allow_remote_fetch: bool = false,
     /// Directories from which local image reads are allowed.
     /// If empty, all local file reads are rejected (only URLs pass through).
     allowed_dirs: []const []const u8 = &.{},
@@ -146,14 +149,16 @@ pub const ImageData = struct {
     mime_type: []const u8,
 };
 
+pub const DataUriImage = struct {
+    data: []const u8,
+    mime_type: []const u8,
+};
+
 /// Read a local image file, validate its size, and detect MIME type.
 /// Returns raw bytes and MIME type. Caller owns the returned `data` slice.
 /// Path is validated against `allowed_dirs` to prevent arbitrary file reads.
 pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: MultimodalConfig) !ImageData {
-    // Validate path: reject traversal patterns
-    if (std.mem.indexOf(u8, path, "..") != null) return error.PathTraversal;
-
-    // Resolve to absolute path
+    // Resolve to absolute path (realpathAlloc resolves ".." and symlinks)
     const resolved = if (std.fs.path.isAbsolute(path))
         std.fs.realpathAlloc(allocator, path) catch return error.PathNotFound
     else blk: {
@@ -165,7 +170,14 @@ pub fn readLocalImage(allocator: std.mem.Allocator, path: []const u8, config: Mu
     if (config.allowed_dirs.len == 0) return error.LocalReadNotAllowed;
     const allowed = blk: {
         for (config.allowed_dirs) |dir| {
-            if (path_security.pathStartsWith(resolved, dir)) break :blk true;
+            const trimmed = std.mem.trimRight(u8, dir, "/\\");
+            if (trimmed.len == 0) continue;
+            if (path_security.pathStartsWith(resolved, trimmed)) break :blk true;
+
+            // Compare against canonicalized allowed dir too (/var -> /private/var on macOS).
+            const canonical = std.fs.realpathAlloc(allocator, trimmed) catch continue;
+            defer allocator.free(canonical);
+            if (path_security.pathStartsWith(resolved, canonical)) break :blk true;
         }
         break :blk false;
     };
@@ -201,6 +213,46 @@ pub fn encodeBase64(allocator: std.mem.Allocator, data: []const u8) ![]const u8 
     const buf = try allocator.alloc(u8, encoded_len);
     _ = encoder.encode(buf, data);
     return buf;
+}
+
+fn isAllowedMimeType(mime: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(mime, "image/png") or
+        std.ascii.eqlIgnoreCase(mime, "image/jpeg") or
+        std.ascii.eqlIgnoreCase(mime, "image/webp") or
+        std.ascii.eqlIgnoreCase(mime, "image/gif") or
+        std.ascii.eqlIgnoreCase(mime, "image/bmp");
+}
+
+/// Parse and validate a data URI image marker.
+/// Returns the base64 payload and MIME type as borrowed slices of `source`.
+fn parseDataUriImage(source: []const u8, max_size_bytes: u64) !DataUriImage {
+    if (!std.mem.startsWith(u8, source, "data:")) return error.InvalidDataUri;
+    const comma = std.mem.indexOfScalar(u8, source, ',') orelse return error.InvalidDataUri;
+
+    const meta = source["data:".len..comma];
+    const payload = std.mem.trim(u8, source[comma + 1 ..], " \t\r\n");
+    if (payload.len == 0) return error.InvalidDataUri;
+
+    var meta_it = std.mem.splitScalar(u8, meta, ';');
+    const mime = std.mem.trim(u8, meta_it.next() orelse "", " \t");
+    if (mime.len == 0 or !isAllowedMimeType(mime)) return error.UnknownImageFormat;
+
+    var has_base64 = false;
+    while (meta_it.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "base64")) {
+            has_base64 = true;
+            break;
+        }
+    }
+    if (!has_base64) return error.InvalidDataUri;
+
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(payload) catch return error.InvalidDataUri;
+    if (decoded_size > max_size_bytes) return error.ImageTooLarge;
+
+    return .{
+        .data = payload,
+        .mime_type = mime,
+    };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -270,20 +322,42 @@ pub fn prepareMessagesForProvider(
 
         const max_images = @min(parsed.refs.len, config.max_images);
         for (parsed.refs[0..max_images]) |ref| {
-            if (isUrl(ref)) {
-                // URL-based image — pass through as image_url
+            // Truncated ref for error messages (avoid leaking huge data URIs)
+            const display_ref = if (ref.len > 80) ref[0..80] else ref;
+
+            if (isDataUrl(ref)) {
+                const data_uri = parseDataUriImage(ref, config.max_image_size_bytes) catch |err| {
+                    log.warn("failed to parse data URI image: {}", .{err});
+                    const note = try std.fmt.allocPrint(arena, "[Failed to load image: {s}...]", .{display_ref});
+                    try parts.append(arena, .{ .text = note });
+                    continue;
+                };
+                try parts.append(arena, .{ .image_base64 = .{
+                    .data = data_uri.data,
+                    .media_type = data_uri.mime_type,
+                } });
+            } else if (isHttpUrl(ref) or isHttpsUrl(ref)) {
+                if (!config.allow_remote_fetch) {
+                    const note = try std.fmt.allocPrint(arena, "[Remote image URLs are disabled: {s}]", .{display_ref});
+                    try parts.append(arena, .{ .text = note });
+                    continue;
+                }
+                if (!isHttpsUrl(ref)) {
+                    const note = try std.fmt.allocPrint(arena, "[Remote image URL must use HTTPS: {s}]", .{display_ref});
+                    try parts.append(arena, .{ .text = note });
+                    continue;
+                }
                 try parts.append(arena, .{ .image_url = .{ .url = ref } });
             } else {
                 // Local file — read + base64 encode
                 const img = readLocalImage(arena, ref, config) catch |err| {
                     log.warn("failed to read image '{s}': {}", .{ ref, err });
-                    // Add error note as text
-                    const note = try std.fmt.allocPrint(arena, "[Failed to load image: {s}]", .{ref});
+                    const note = try std.fmt.allocPrint(arena, "[Failed to load image: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
                 };
                 const b64 = encodeBase64(arena, img.data) catch {
-                    const note = try std.fmt.allocPrint(arena, "[Failed to encode image: {s}]", .{ref});
+                    const note = try std.fmt.allocPrint(arena, "[Failed to encode image: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
                 };
@@ -291,7 +365,7 @@ pub fn prepareMessagesForProvider(
                     .data = b64,
                     .media_type = img.mime_type,
                 } });
-                // Clean up temp file after successful read (only nullclaw_photo_ files)
+                // Clean up temp file after successful read
                 if (std.mem.indexOf(u8, ref, "nullclaw_photo_") != null) {
                     std.fs.deleteFileAbsolute(ref) catch {};
                 }
@@ -310,11 +384,65 @@ pub fn prepareMessagesForProvider(
     return result;
 }
 
+/// Count image markers across user messages.
+pub fn countImageMarkers(messages: []const ChatMessage) usize {
+    var total: usize = 0;
+    for (messages) |msg| {
+        if (msg.role != .user or msg.content.len == 0) continue;
+        total += countImageMarkersInText(msg.content);
+    }
+    return total;
+}
+
+/// Count image markers in the most recent user message only.
+pub fn countImageMarkersInLastUser(messages: []const ChatMessage) usize {
+    var i = messages.len;
+    while (i > 0) : (i -= 1) {
+        const idx = i - 1;
+        const msg = messages[idx];
+        if (msg.role != .user or msg.content.len == 0) continue;
+        return countImageMarkersInText(msg.content);
+    }
+    return 0;
+}
+
+fn countImageMarkersInText(content: []const u8) usize {
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < content.len) {
+        const open_pos = std.mem.indexOfPos(u8, content, cursor, "[") orelse break;
+        const close_pos = std.mem.indexOfPos(u8, content, open_pos, "]") orelse break;
+        const marker = content[open_pos + 1 .. close_pos];
+        if (std.mem.indexOf(u8, marker, ":")) |colon_pos| {
+            const kind_str = marker[0..colon_pos];
+            const target = std.mem.trim(u8, marker[colon_pos + 1 ..], " ");
+            if (target.len > 0 and isImageKind(kind_str)) {
+                count += 1;
+            }
+        }
+        cursor = close_pos + 1;
+    }
+    return count;
+}
+
 /// Returns true if the string looks like a URL.
 pub fn isUrl(s: []const u8) bool {
-    return std.mem.startsWith(u8, s, "http://") or
-        std.mem.startsWith(u8, s, "https://") or
-        std.mem.startsWith(u8, s, "data:");
+    return isHttpUrl(s) or isHttpsUrl(s) or isDataUrl(s);
+}
+
+fn isHttpUrl(s: []const u8) bool {
+    if (s.len < 7) return false;
+    return std.ascii.eqlIgnoreCase(s[0..7], "http://");
+}
+
+fn isHttpsUrl(s: []const u8) bool {
+    if (s.len < 8) return false;
+    return std.ascii.eqlIgnoreCase(s[0..8], "https://");
+}
+
+fn isDataUrl(s: []const u8) bool {
+    if (s.len < 5) return false;
+    return std.ascii.eqlIgnoreCase(s[0..5], "data:");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -540,9 +668,44 @@ test "prepareMessagesForProvider with URL marker creates content_parts" {
     // First part: text
     try std.testing.expect(parts[0] == .text);
     try std.testing.expectEqualStrings("Check this  out", parts[0].text);
-    // Second part: image_url
+    // Second part: explicit policy note (remote URLs disabled by default)
+    try std.testing.expect(parts[1] == .text);
+    try std.testing.expect(std.mem.indexOf(u8, parts[1].text, "Remote image URLs are disabled") != null);
+}
+
+test "prepareMessagesForProvider with URL marker allowed by config" {
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    var msgs = [_]ChatMessage{
+        ChatMessage.user("Check this [IMAGE:https://example.com/cat.jpg] out"),
+    };
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{ .allow_remote_fetch = true });
+    const parts = result[0].content_parts.?;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
     try std.testing.expect(parts[1] == .image_url);
     try std.testing.expectEqualStrings("https://example.com/cat.jpg", parts[1].image_url.url);
+}
+
+test "prepareMessagesForProvider with data URI marker creates base64 image part" {
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    var msgs = [_]ChatMessage{
+        ChatMessage.user("Analyze [IMAGE:data:image/png;base64,iVBORw0KGgo=]"),
+    };
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{});
+    const parts = result[0].content_parts.?;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expect(parts[1] == .image_base64);
+    try std.testing.expectEqualStrings("image/png", parts[1].image_base64.media_type);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", parts[1].image_base64.data);
 }
 
 test "prepareMessagesForProvider skips assistant messages" {
@@ -559,9 +722,10 @@ test "prepareMessagesForProvider skips assistant messages" {
     try std.testing.expect(result[0].content_parts == null);
 }
 
-test "readLocalImage rejects path traversal" {
+test "readLocalImage rejects path traversal via allowed_dirs" {
+    // ".." is resolved by realpathAlloc; the resolved path won't match allowed_dirs
     const err = readLocalImage(std.testing.allocator, "/tmp/../etc/passwd", .{});
-    try std.testing.expectError(error.PathTraversal, err);
+    try std.testing.expectError(error.LocalReadNotAllowed, err);
 }
 
 test "readLocalImage rejects when no allowed_dirs" {
@@ -629,4 +793,22 @@ test "quick-check handles mixed case IMAGE markers" {
 test "MultimodalConfig allowed_dirs defaults empty" {
     const cfg = MultimodalConfig{};
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_dirs.len);
+}
+
+test "countImageMarkers counts user image markers only" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("One [IMAGE:/tmp/a.png]"),
+        ChatMessage.assistant("[IMAGE:/tmp/ignored.png]"),
+        ChatMessage.user("Two [PHOTO:/tmp/b.png] [IMG:/tmp/c.png]"),
+    };
+    try std.testing.expectEqual(@as(usize, 3), countImageMarkers(&msgs));
+}
+
+test "countImageMarkersInLastUser only counts latest user message" {
+    const msgs = [_]ChatMessage{
+        ChatMessage.user("Old [IMAGE:/tmp/old.png]"),
+        ChatMessage.assistant("ack"),
+        ChatMessage.user("No image here"),
+    };
+    try std.testing.expectEqual(@as(usize, 0), countImageMarkersInLastUser(&msgs));
 }

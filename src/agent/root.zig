@@ -317,14 +317,33 @@ pub const Agent = struct {
                 for (self.history.items, 0..) |*msg, i| {
                     m[i] = msg.toChatMessage();
                 }
+                const image_marker_count = multimodal.countImageMarkersInLastUser(m);
+                if (image_marker_count > 0 and !self.provider.supportsVision()) {
+                    return error.ProviderDoesNotSupportVision;
+                }
                 // Process [IMAGE:] markers into content_parts for multimodal support
                 // Allow reading from the platform temp dir (where Telegram photos are saved)
                 const tmp_dir = platform.getTempDir(arena) catch null;
                 const allowed: []const []const u8 = if (tmp_dir) |td| blk2: {
+                    const trimmed_tmp = std.mem.trimRight(u8, td, "/\\");
+                    if (trimmed_tmp.len == 0) break :blk2 &.{};
+
+                    const resolved_tmp = std.fs.realpathAlloc(arena, trimmed_tmp) catch null;
+                    if (resolved_tmp) |rt| {
+                        // Include both env TMPDIR and canonical realpath to handle
+                        // /var vs /private/var aliases on macOS.
+                        if (!std.mem.eql(u8, rt, trimmed_tmp)) {
+                            const dirs = try arena.alloc([]const u8, 2);
+                            dirs[0] = trimmed_tmp;
+                            dirs[1] = rt;
+                            break :blk2 dirs;
+                        }
+                    }
+
                     const dirs = try arena.alloc([]const u8, 1);
                     // Strip trailing separator so pathStartsWith works correctly
                     // (TMPDIR on macOS ends with '/')
-                    dirs[0] = std.mem.trimRight(u8, td, "/\\");
+                    dirs[0] = trimmed_tmp;
                     break :blk2 dirs;
                 } else &.{};
                 break :blk try multimodal.prepareMessagesForProvider(arena, m, .{

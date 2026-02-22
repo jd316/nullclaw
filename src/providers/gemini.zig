@@ -327,6 +327,7 @@ pub const GeminiProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_vision = supportsVisionImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
     };
@@ -391,6 +392,10 @@ pub const GeminiProvider = struct {
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
         return false;
+    }
+
+    fn supportsVisionImpl(_: *anyopaque) bool {
+        return true;
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
