@@ -923,6 +923,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         }
     else
         null;
+    defer if (mcp_tools) |mt| allocator.free(mt);
 
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
@@ -952,7 +953,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
     }) catch &.{};
-    defer if (tools.len > 0) allocator.free(tools);
+    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
@@ -1192,6 +1193,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         }
     else
         null;
+    defer if (mcp_tools) |mt| allocator.free(mt);
 
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
@@ -1221,7 +1223,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
     }) catch &.{};
-    defer if (tools.len > 0) allocator.free(tools);
+    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});

@@ -5,8 +5,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const http_util = @import("http_util.zig");
-const platform_mod = @import("platform.zig");
 
 const log = std.log.scoped(.update);
 
@@ -94,6 +92,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
         std.debug.print("Please download manually from: {s}\n", .{latest.html_url});
         return error.NoAssetFound;
     };
+    defer allocator.free(download_url);
 
     // Confirm update
     if (!opts.yes) {
@@ -139,7 +138,8 @@ pub fn detectInstallMethod() !InstallMethod {
 
     // Check for homebrew
     if (std.mem.indexOf(u8, exe_path, "/homebrew/") != null or
-        std.mem.indexOf(u8, exe_path, "/Cellar/") != null) {
+        std.mem.indexOf(u8, exe_path, "/Cellar/") != null)
+    {
         return .homebrew;
     }
 
@@ -300,7 +300,7 @@ fn downloadAndInstall(
 ) !void {
     std.debug.print("Downloading {s}...\n", .{asset_name});
 
-    const data = http_util.curlGet(allocator, url, &.{}, "60") catch |err| {
+    const data = downloadWithRedirects(allocator, url) catch |err| {
         log.err("Download failed: {}", .{err});
         return error.DownloadFailed;
     };
@@ -316,8 +316,9 @@ fn downloadAndInstall(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.partial", .{exe_path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
-    defer tmp_file.close();
+    var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    var tmp_closed = false;
+    defer if (!tmp_closed) tmp_file.close();
 
     // Write data
     try tmp_file.writeAll(data);
@@ -329,10 +330,38 @@ fn downloadAndInstall(
         };
     }
 
+    // Close handle before rename/replacement (required on Windows).
+    tmp_file.close();
+    tmp_closed = true;
+
     // Atomic replacement
     try atomicReplace(tmp_path, exe_path);
 
     std.debug.print("Installed successfully.\n", .{});
+}
+
+fn downloadWithRedirects(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "-sfL", "--max-time", "60", url },
+    }) catch |err| {
+        log.err("curl failed: {}", .{err});
+        return error.CurlFailed;
+    };
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return error.CurlFailed;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.CurlFailed;
+        },
+    }
+
+    return result.stdout;
 }
 
 fn atomicReplace(tmp_path: []const u8, exe_path: []const u8) !void {

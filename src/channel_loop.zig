@@ -98,6 +98,7 @@ pub const ChannelRuntime = struct {
             }
         else
             null;
+        defer if (mcp_tools) |mt| allocator.free(mt);
 
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
@@ -109,7 +110,7 @@ pub const ChannelRuntime = struct {
             .fallback_api_key = resolved_key,
             .tools_config = config.tools,
         }) catch &.{};
-        errdefer if (tools.len > 0) allocator.free(tools);
+        errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
         // Optional memory backend
         var mem_opt: ?memory_mod.Memory = null;
@@ -147,7 +148,7 @@ pub const ChannelRuntime = struct {
     pub fn deinit(self: *ChannelRuntime) void {
         const alloc = self.allocator;
         self.session_mgr.deinit();
-        if (self.tools.len > 0) alloc.free(self.tools);
+        if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
         alloc.destroy(self.noop_obs);
         alloc.destroy(self.provider_holder);
         alloc.destroy(self);
