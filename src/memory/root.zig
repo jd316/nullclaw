@@ -280,6 +280,7 @@ pub fn createMemory(allocator: std.mem.Allocator, backend_name: []const u8, path
         .none_backend => {
             const impl_ = try allocator.create(NoneMemory);
             impl_.* = NoneMemory.init();
+            impl_.allocator = allocator;
             return impl_.memory();
         },
         .unknown => {

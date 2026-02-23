@@ -352,7 +352,9 @@ pub const SqliteMemory = struct {
 
     fn implDeinit(ptr: *anyopaque) void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self_.allocator;
         self_.deinit();
+        alloc.destroy(self_);
     }
 
     pub const vtable = Memory.VTable{

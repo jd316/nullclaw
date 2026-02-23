@@ -312,7 +312,9 @@ pub const MarkdownMemory = struct {
 
     fn implDeinit(ptr: *anyopaque) void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self_.allocator;
         self_.deinit();
+        alloc.destroy(self_);
     }
 
     const vtable = Memory.VTable{

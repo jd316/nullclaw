@@ -439,7 +439,9 @@ pub const LucidMemory = struct {
 
     fn implDeinit(ptr: *anyopaque) void {
         const self = castSelf(ptr);
+        const alloc = self.allocator;
         self.deinit();
+        alloc.destroy(self);
     }
 
     fn castSelf(ptr: *anyopaque) *Self {
