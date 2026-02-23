@@ -65,6 +65,8 @@ pub const SessionManager = struct {
         mem: ?Memory,
         observer_i: Observer,
     ) SessionManager {
+        tools_mod.bindMemoryTools(tools, mem);
+
         return .{
             .allocator = allocator,
             .config = config,

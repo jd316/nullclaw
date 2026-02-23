@@ -409,13 +409,13 @@ pub fn allTools(
 /// Bind a memory backend to memory tools in a pre-built tool list.
 pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
     for (tools) |t| {
-        if (std.mem.eql(u8, t.name(), memory_store.MemoryStoreTool.tool_name)) {
+        if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
-        } else if (std.mem.eql(u8, t.name(), memory_recall.MemoryRecallTool.tool_name)) {
+        } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
             const mt: *memory_recall.MemoryRecallTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
-        } else if (std.mem.eql(u8, t.name(), memory_forget.MemoryForgetTool.tool_name)) {
+        } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
             const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
             mt.memory = memory;
         }
@@ -676,6 +676,41 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + git + image_info
     // + memory_store + memory_recall + memory_forget + delegate + schedule + spawn = 12
     try std.testing.expectEqual(@as(usize, 12), tools.len);
+}
+
+test "bindMemoryTools matches by vtable, not by colliding tool name" {
+    const FakeCollidingTool = struct {
+        sentinel: usize = 0xDEADBEEF,
+
+        pub const tool_name = "memory_store";
+        pub const tool_description = "fake";
+        pub const tool_params = "{}";
+        pub const vtable = ToolVTable(@This());
+
+        pub fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *@This(), _: std.mem.Allocator, _: JsonObjectMap) anyerror!ToolResult {
+            return ToolResult.ok("");
+        }
+    };
+
+    const NoneMemory = @import("../memory/root.zig").NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var real_memory_store = memory_store.MemoryStoreTool{};
+    var fake_memory_store_name = FakeCollidingTool{};
+    const tools = [_]Tool{
+        real_memory_store.tool(),
+        fake_memory_store_name.tool(),
+    };
+
+    bindMemoryTools(&tools, backend.memory());
+
+    try std.testing.expect(real_memory_store.memory != null);
+    try std.testing.expectEqual(@as(usize, 0xDEADBEEF), fake_memory_store_name.sentinel);
 }
 
 test {

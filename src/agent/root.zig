@@ -121,8 +121,6 @@ pub const Agent = struct {
         mem: ?Memory,
         observer_i: Observer,
     ) !Agent {
-        tools_mod.bindMemoryTools(tools, mem);
-
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
         for (tools, 0..) |t, i| {
@@ -1850,7 +1848,7 @@ test "milliTimestamp negative difference clamps to zero" {
     try std.testing.expectEqual(@as(u64, 0), duration);
 }
 
-test "Agent.fromConfig wires memory tools to sqlite backend" {
+test "bindMemoryTools wires memory tools to sqlite backend" {
     const allocator = std.testing.allocator;
 
     var cfg = Config{
@@ -1864,6 +1862,7 @@ test "Agent.fromConfig wires memory tools to sqlite backend" {
 
     var mem = try memory_mod.createMemory(allocator, "sqlite", ":memory:");
     defer mem.deinit();
+    tools_mod.bindMemoryTools(tools, mem);
 
     const DummyProvider = struct {
         fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {

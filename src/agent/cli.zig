@@ -124,6 +124,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else |_| {}
     defer if (mem_opt) |m| m.deinit();
 
+    // Bind memory backend once for this tool set before creating agents.
+    tools_mod.bindMemoryTools(tools, mem_opt);
+
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();
 
