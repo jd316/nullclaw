@@ -485,3 +485,14 @@ test "SignalLoopState last_activity update" {
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
 }
+
+test "signalGroupPeerId extracts group id from reply target" {
+    const peer_id = signalGroupPeerId("group:1203630@g.us");
+    try std.testing.expectEqualStrings("1203630@g.us", peer_id);
+}
+
+test "signalGroupPeerId falls back when reply target is missing or malformed" {
+    try std.testing.expectEqualStrings("unknown", signalGroupPeerId(null));
+    try std.testing.expectEqualStrings("group:", signalGroupPeerId("group:"));
+    try std.testing.expectEqualStrings("direct:+15550001111", signalGroupPeerId("direct:+15550001111"));
+}

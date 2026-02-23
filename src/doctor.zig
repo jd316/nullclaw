@@ -11,6 +11,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
+const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
 const builtin = @import("builtin");
@@ -662,38 +663,11 @@ fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.A
     const cat = "channels";
     items.append(allocator, DiagItem.ok(cat, "CLI always available")) catch {};
 
-    if (cfg.channels.telegram.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "Telegram configured")) catch {};
-    if (cfg.channels.discord.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "Discord configured")) catch {};
-    if (cfg.channels.slack.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "Slack configured")) catch {};
-    if (cfg.channels.webhook != null)
-        items.append(allocator, DiagItem.ok(cat, "Webhook configured")) catch {};
-    if (cfg.channels.matrix != null)
-        items.append(allocator, DiagItem.ok(cat, "Matrix configured")) catch {};
-    if (cfg.channels.irc != null)
-        items.append(allocator, DiagItem.ok(cat, "IRC configured")) catch {};
-    if (cfg.channels.signal.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "Signal configured")) catch {};
-    if (cfg.channels.imessage != null)
-        items.append(allocator, DiagItem.ok(cat, "iMessage configured")) catch {};
-    if (cfg.channels.whatsapp != null)
-        items.append(allocator, DiagItem.ok(cat, "WhatsApp configured")) catch {};
-    if (cfg.channels.lark != null)
-        items.append(allocator, DiagItem.ok(cat, "Lark configured")) catch {};
-    if (cfg.channels.dingtalk != null)
-        items.append(allocator, DiagItem.ok(cat, "DingTalk configured")) catch {};
-    if (cfg.channels.email != null)
-        items.append(allocator, DiagItem.ok(cat, "Email configured")) catch {};
-    if (cfg.channels.line != null)
-        items.append(allocator, DiagItem.ok(cat, "Line configured")) catch {};
-    if (cfg.channels.qq.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "QQ configured")) catch {};
-    if (cfg.channels.onebot.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "OneBot configured")) catch {};
-    if (cfg.channels.maixcam.len > 0)
-        items.append(allocator, DiagItem.ok(cat, "MaixCam configured")) catch {};
+    for (channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli) continue;
+        if (!channel_catalog.isConfigured(cfg, meta.id)) continue;
+        items.append(allocator, DiagItem.ok(cat, meta.configured_message)) catch {};
+    }
 }
 
 /// Check a specific diagnostic (utility for programmatic access).

@@ -16,6 +16,7 @@ const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
+const channel_catalog = @import("channel_catalog.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -119,21 +120,7 @@ pub fn computeBackoff(current_backoff: u64, max_backoff: u64) u64 {
 
 /// Check if any real-time channels are configured.
 pub fn hasSupervisedChannels(config: *const Config) bool {
-    return config.channels.telegram.len > 0 or
-        config.channels.discord.len > 0 or
-        config.channels.slack.len > 0 or
-        config.channels.imessage != null or
-        config.channels.matrix != null or
-        config.channels.whatsapp != null or
-        config.channels.signal.len > 0 or
-        config.channels.irc != null or
-        config.channels.lark != null or
-        config.channels.dingtalk != null or
-        config.channels.email != null or
-        config.channels.line != null or
-        config.channels.qq.len > 0 or
-        config.channels.onebot.len > 0 or
-        config.channels.maixcam.len > 0;
+    return channel_catalog.hasSupervisedChannels(config);
 }
 
 /// Shutdown signal — set to true to stop the daemon.
@@ -688,6 +675,156 @@ test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
     try std.testing.expectEqualStrings("agent:camera-agent:vision-cam:direct:device-1", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "discord-channel-agent",
+            .match = .{
+                .channel = "discord",
+                .account_id = "discord-main",
+                .peer = .{ .kind = .channel, .id = "778899" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .discord = &[_]@import("config_types.zig").DiscordConfig{
+                .{ .account_id = "discord-main", .token = "token" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-1",
+        .chat_id = "778899",
+        .content = "hello",
+        .session_key = "discord:778899",
+        .metadata_json = "{\"guild_id\":\"guild-1\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:discord-channel-agent:discord:channel:778899", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes discord direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "discord-dm-agent",
+            .match = .{
+                .channel = "discord",
+                .account_id = "discord-main",
+                .peer = .{ .kind = .direct, .id = "user-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .discord = &[_]@import("config_types.zig").DiscordConfig{
+                .{ .account_id = "discord-main", .token = "token" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "some-channel",
+        .content = "ping",
+        .session_key = "discord:dm:user-42",
+        .metadata_json = "{\"is_dm\":true}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:discord-dm-agent:discord:direct:user-42", routed.?);
+}
+
+test "resolveInboundRouteSessionKey normalizes qq channel prefix for routed peer id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "qq-channel-agent",
+            .match = .{
+                .channel = "qq",
+                .account_id = "qq-main",
+                .peer = .{ .kind = .channel, .id = "998877" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .qq = &[_]@import("config_types.zig").QQConfig{
+                .{ .account_id = "qq-main" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "qq",
+        .sender_id = "qq-user",
+        .chat_id = "channel:998877",
+        .content = "hello",
+        .session_key = "qq:channel:998877",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:qq-channel-agent:qq:channel:998877", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "qq-dm-agent",
+            .match = .{
+                .channel = "qq",
+                .account_id = "qq-main",
+                .peer = .{ .kind = .direct, .id = "qq-user-1" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .qq = &[_]@import("config_types.zig").QQConfig{
+                .{ .account_id = "qq-main" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "qq",
+        .sender_id = "qq-user-1",
+        .chat_id = "dm:session-abc",
+        .content = "hello",
+        .session_key = "qq:dm:session-abc",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:qq-dm-agent:qq:direct:qq-user-1", routed.?);
 }
 
 test "stateFilePath derives from config_path" {

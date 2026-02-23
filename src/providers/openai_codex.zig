@@ -255,9 +255,11 @@ fn buildCodexBody(
         }
     }
 
+    try buf.appendSlice(allocator, ",\"instructions\":");
     if (instructions) |inst| {
-        try buf.appendSlice(allocator, ",\"instructions\":");
         try root.appendJsonString(&buf, allocator, inst);
+    } else {
+        try buf.appendSlice(allocator, "\"You are a helpful assistant.\"");
     }
 
     // Build input items array — last user message becomes input, rest are context
@@ -307,9 +309,11 @@ fn buildSimpleCodexBody(
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\"");
 
+    try buf.appendSlice(allocator, ",\"instructions\":");
     if (system) |sys| {
-        try buf.appendSlice(allocator, ",\"instructions\":");
         try root.appendJsonString(&buf, allocator, sys);
+    } else {
+        try buf.appendSlice(allocator, "\"You are a helpful assistant.\"");
     }
 
     try buf.appendSlice(allocator, ",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":");
@@ -754,7 +758,7 @@ test "buildSimpleCodexBody without system prompt" {
     const body = try buildSimpleCodexBody(std.testing.allocator, null, "Hello", "o4-mini");
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are a helpful assistant.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Hello") != null);
 }
 

@@ -675,3 +675,135 @@ test "ChannelManager no channels configured" {
     try std.testing.expectEqual(@as(usize, 0), mgr.count());
     try std.testing.expectEqual(@as(usize, 0), mgr.channelEntries().len);
 }
+
+fn countEntriesByListenerType(entries: []const Entry, listener_type: ListenerType) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (entry.listener_type == listener_type) count += 1;
+    }
+    return count;
+}
+
+fn findEntryByNameAccount(entries: []const Entry, name: []const u8, account_id: []const u8) ?*const Entry {
+    for (entries) |*entry| {
+        if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.account_id, account_id)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+test "ChannelManager collectConfiguredChannels wires listener types accounts and bus" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const telegram_accounts = [_]@import("config_types.zig").TelegramConfig{
+        .{ .account_id = "main", .bot_token = "tg-main-token" },
+        .{ .account_id = "backup", .bot_token = "tg-backup-token" },
+    };
+    const signal_accounts = [_]@import("config_types.zig").SignalConfig{
+        .{
+            .account_id = "sig-main",
+            .http_url = "http://localhost:8080",
+            .account = "+15550001111",
+        },
+    };
+    const discord_accounts = [_]@import("config_types.zig").DiscordConfig{
+        .{ .account_id = "dc-main", .token = "discord-token" },
+    };
+    const qq_accounts = [_]@import("config_types.zig").QQConfig{
+        .{
+            .account_id = "qq-main",
+            .app_id = "appid",
+            .app_secret = "appsecret",
+            .bot_token = "bottoken",
+        },
+    };
+    const onebot_accounts = [_]@import("config_types.zig").OneBotConfig{
+        .{ .account_id = "ob-main", .url = "ws://localhost:6700" },
+    };
+    const slack_accounts = [_]@import("config_types.zig").SlackConfig{
+        .{ .account_id = "sl-main", .bot_token = "xoxb-token" },
+    };
+    const maixcam_accounts = [_]@import("config_types.zig").MaixCamConfig{
+        .{ .account_id = "cam-main", .name = "maixcam-main" },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+            .signal = &signal_accounts,
+            .discord = &discord_accounts,
+            .qq = &qq_accounts,
+            .onebot = &onebot_accounts,
+            .slack = &slack_accounts,
+            .maixcam = &maixcam_accounts,
+            .whatsapp = .{
+                .account_id = "wa-main",
+                .access_token = "wa-access",
+                .phone_number_id = "123456",
+                .verify_token = "wa-verify",
+            },
+            .line = .{
+                .account_id = "line-main",
+                .access_token = "line-token",
+                .channel_secret = "line-secret",
+            },
+            .lark = .{
+                .account_id = "lark-main",
+                .app_id = "cli_xxx",
+                .app_secret = "secret_xxx",
+            },
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    var event_bus = bus_mod.Bus.init();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+    mgr.setEventBus(&event_bus);
+
+    try mgr.collectConfiguredChannels();
+
+    try std.testing.expectEqual(@as(usize, 11), mgr.count());
+    try std.testing.expectEqual(@as(usize, 11), reg.count());
+
+    const entries = mgr.channelEntries();
+    try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .polling));
+    try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .gateway_loop));
+    try std.testing.expectEqual(@as(usize, 3), countEntriesByListenerType(entries, .webhook_only));
+    try std.testing.expectEqual(@as(usize, 2), countEntriesByListenerType(entries, .send_only));
+    try std.testing.expectEqual(@as(usize, 0), countEntriesByListenerType(entries, .not_implemented));
+
+    try std.testing.expect(findEntryByNameAccount(entries, "telegram", "main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "telegram", "backup") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "signal", "sig-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "discord", "dc-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "qq", "qq-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "onebot", "ob-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "slack", "sl-main") != null);
+    try std.testing.expect(findEntryByNameAccount(entries, "maixcam", "cam-main") != null);
+
+    const discord_entry = findEntryByNameAccount(entries, "discord", "dc-main").?;
+    const discord_ptr: *discord.DiscordChannel = @ptrCast(@alignCast(discord_entry.channel.ptr));
+    try std.testing.expect(discord_ptr.bus == &event_bus);
+
+    const qq_entry = findEntryByNameAccount(entries, "qq", "qq-main").?;
+    const qq_ptr: *qq.QQChannel = @ptrCast(@alignCast(qq_entry.channel.ptr));
+    try std.testing.expect(qq_ptr.event_bus == &event_bus);
+
+    const onebot_entry = findEntryByNameAccount(entries, "onebot", "ob-main").?;
+    const onebot_ptr: *onebot.OneBotChannel = @ptrCast(@alignCast(onebot_entry.channel.ptr));
+    try std.testing.expect(onebot_ptr.event_bus == &event_bus);
+
+    const maixcam_entry = findEntryByNameAccount(entries, "maixcam", "cam-main").?;
+    const maixcam_ptr: *maixcam.MaixCamChannel = @ptrCast(@alignCast(maixcam_entry.channel.ptr));
+    try std.testing.expect(maixcam_ptr.event_bus == &event_bus);
+}

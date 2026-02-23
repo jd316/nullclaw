@@ -1594,6 +1594,107 @@ test "parse whatsapp accounts" {
     allocator.free(wc.allow_from);
 }
 
+test "parse signal multi-account sorted alphabetically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"signal": {"accounts": {"z-main": {"http_url": "http://localhost:8082", "account": "+155502", "ignore_attachments": true}, "a-main": {"http_url": "http://localhost:8081", "account": "+155501"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.signal.len);
+    try std.testing.expectEqualStrings("a-main", cfg.channels.signal[0].account_id);
+    try std.testing.expectEqualStrings("+155501", cfg.channels.signal[0].account);
+    try std.testing.expectEqualStrings("z-main", cfg.channels.signal[1].account_id);
+    try std.testing.expect(cfg.channels.signal[1].ignore_attachments);
+}
+
+test "parse qq accounts include allowlist and allowed_groups" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"qq": {"accounts": {"qq-backup": {"app_id": "app2", "bot_token": "tok2"}, "qq-main": {"app_id": "app1", "app_secret": "sec1", "bot_token": "tok1", "group_policy": "allowlist", "allowed_groups": ["group-a", "group-b"], "allow_from": ["user-a"]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.qq.len);
+    try std.testing.expectEqualStrings("qq-backup", cfg.channels.qq[0].account_id);
+    try std.testing.expectEqualStrings("qq-main", cfg.channels.qq[1].account_id);
+    try std.testing.expectEqual(config_types.QQGroupPolicy.allowlist, cfg.channels.qq[1].group_policy);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.qq[1].allowed_groups.len);
+    try std.testing.expectEqualStrings("group-a", cfg.channels.qq[1].allowed_groups[0]);
+    try std.testing.expectEqualStrings("group-b", cfg.channels.qq[1].allowed_groups[1]);
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.qq[1].allow_from.len);
+    try std.testing.expectEqualStrings("user-a", cfg.channels.qq[1].allow_from[0]);
+}
+
+test "parse onebot multi-account sorted alphabetically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"onebot": {"accounts": {"west": {"url": "ws://west.local:6700"}, "east": {"url": "ws://east.local:6700", "group_trigger_prefix": "/bot"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.onebot.len);
+    try std.testing.expectEqualStrings("east", cfg.channels.onebot[0].account_id);
+    try std.testing.expectEqualStrings("ws://east.local:6700", cfg.channels.onebot[0].url);
+    try std.testing.expectEqualStrings("/bot", cfg.channels.onebot[0].group_trigger_prefix.?);
+    try std.testing.expectEqualStrings("west", cfg.channels.onebot[1].account_id);
+}
+
+test "parse maixcam multi-account sorted with custom names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"maixcam": {"accounts": {"cam-z": {"port": 8888, "name": "vision-z"}, "cam-a": {"port": 7777, "name": "vision-a", "allow_from": ["device-1"]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.maixcam.len);
+    try std.testing.expectEqualStrings("cam-a", cfg.channels.maixcam[0].account_id);
+    try std.testing.expectEqualStrings("vision-a", cfg.channels.maixcam[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.maixcam[0].allow_from.len);
+    try std.testing.expectEqualStrings("device-1", cfg.channels.maixcam[0].allow_from[0]);
+    try std.testing.expectEqualStrings("cam-z", cfg.channels.maixcam[1].account_id);
+    try std.testing.expectEqual(@as(u16, 8888), cfg.channels.maixcam[1].port);
+}
+
+test "single-account channels prefer accounts.default when multiple exist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"line": {"accounts": {"main": {"access_token": "line-main", "channel_secret": "line-main-secret"}, "default": {"access_token": "line-default", "channel_secret": "line-default-secret"}}}, "whatsapp": {"accounts": {"main": {"access_token": "wa-main", "phone_number_id": "100", "verify_token": "main-v"}, "default": {"access_token": "wa-default", "phone_number_id": "200", "verify_token": "default-v"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.line != null);
+    try std.testing.expect(cfg.channels.whatsapp != null);
+    try std.testing.expectEqualStrings("default", cfg.channels.line.?.account_id);
+    try std.testing.expectEqualStrings("line-default", cfg.channels.line.?.access_token);
+    try std.testing.expectEqualStrings("default", cfg.channels.whatsapp.?.account_id);
+    try std.testing.expectEqualStrings("wa-default", cfg.channels.whatsapp.?.access_token);
+}
+
+test "single-account channels prefer accounts.main when default missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"channels": {"lark": {"accounts": {"backup": {"app_id": "app-b", "app_secret": "sec-b"}, "main": {"app_id": "app-main", "app_secret": "sec-main"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.lark != null);
+    try std.testing.expectEqualStrings("main", cfg.channels.lark.?.account_id);
+    try std.testing.expectEqualStrings("app-main", cfg.channels.lark.?.app_id);
+}
+
 test "parse imessage config" {
     const allocator = std.testing.allocator;
     const json =
@@ -1740,6 +1841,9 @@ test "multi-account: primary returns null for empty slice" {
     try std.testing.expect(cfg_ch.discordPrimary() == null);
     try std.testing.expect(cfg_ch.slackPrimary() == null);
     try std.testing.expect(cfg_ch.signalPrimary() == null);
+    try std.testing.expect(cfg_ch.qqPrimary() == null);
+    try std.testing.expect(cfg_ch.onebotPrimary() == null);
+    try std.testing.expect(cfg_ch.maixcamPrimary() == null);
 }
 
 test "multi-account: account config overrides base fields" {

@@ -1900,6 +1900,144 @@ test "whatsappSessionKeyRouted uses route engine when config exists" {
     try std.testing.expectEqualStrings("agent:wa-agent:whatsapp:group:1203630@g.us", key);
 }
 
+test "telegramSessionKeyRouted uses group peer for group chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":-10012345,"type":"supergroup"}}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-group-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .group, .id = "-10012345" },
+                },
+            },
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, -10012345, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-group-agent:telegram:group:-10012345", key);
+}
+
+test "telegramSessionKeyRouted uses direct peer for private chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":4242,"type":"private"}}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-dm-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .direct, .id = "4242" },
+                },
+            },
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
+}
+
+test "lineSessionKeyRouted uses group id for group events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U111",
+        .group_id = "G222",
+        .source_type = "group",
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "line-group-agent",
+                .match = .{
+                    .channel = "line",
+                    .account_id = "line-main",
+                    .peer = .{ .kind = .group, .id = "G222" },
+                },
+            },
+        },
+    };
+
+    const key = lineSessionKeyRouted(allocator, &key_buf, evt, &cfg, "line-main");
+    try std.testing.expectEqualStrings("agent:line-group-agent:line:group:G222", key);
+}
+
+test "lineSessionKeyRouted falls back to user session key without config" {
+    const allocator = std.testing.allocator;
+    var key_buf: [128]u8 = undefined;
+    const evt = channels.line.LineEvent{
+        .event_type = "message",
+        .user_id = "U777",
+    };
+
+    const key = lineSessionKeyRouted(allocator, &key_buf, evt, null, "default");
+    try std.testing.expectEqualStrings("line:U777", key);
+}
+
+test "larkSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    const msg = channels.lark.ParsedLarkMessage{
+        .sender = "ou_abc123",
+        .content = "hello",
+        .timestamp = 123,
+        .is_group = true,
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "lark-group-agent",
+                .match = .{
+                    .channel = "lark",
+                    .account_id = "lark-main",
+                    .peer = .{ .kind = .group, .id = "ou_abc123" },
+                },
+            },
+        },
+    };
+
+    const key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
+    try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", key);
+}
+
 // ── extractBody tests ────────────────────────────────────────────
 
 test "extractBody finds body after headers" {

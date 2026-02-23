@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const version = @import("version.zig");
+const channel_catalog = @import("channel_catalog.zig");
 
 pub fn run(allocator: std.mem.Allocator) !void {
     var buf: [4096]u8 = undefined;
@@ -83,23 +84,14 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     // Channels
     try w.print("Channels:\n", .{});
-    try w.print("  CLI:       always\n", .{});
-    try w.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram.len > 0) "configured" else "not configured"});
-    try w.print("  Discord:   {s}\n", .{if (cfg.channels.discord.len > 0) "configured" else "not configured"});
-    try w.print("  Slack:     {s}\n", .{if (cfg.channels.slack.len > 0) "configured" else "not configured"});
-    try w.print("  Webhook:   {s}\n", .{if (cfg.channels.webhook != null) "configured" else "not configured"});
-    try w.print("  Matrix:    {s}\n", .{if (cfg.channels.matrix != null) "configured" else "not configured"});
-    try w.print("  IRC:       {s}\n", .{if (cfg.channels.irc != null) "configured" else "not configured"});
-    try w.print("  Signal:    {s}\n", .{if (cfg.channels.signal.len > 0) "configured" else "not configured"});
-    try w.print("  iMessage:  {s}\n", .{if (cfg.channels.imessage != null) "configured" else "not configured"});
-    try w.print("  WhatsApp:  {s}\n", .{if (cfg.channels.whatsapp != null) "configured" else "not configured"});
-    try w.print("  Lark:      {s}\n", .{if (cfg.channels.lark != null) "configured" else "not configured"});
-    try w.print("  DingTalk:  {s}\n", .{if (cfg.channels.dingtalk != null) "configured" else "not configured"});
-    try w.print("  Email:     {s}\n", .{if (cfg.channels.email != null) "configured" else "not configured"});
-    try w.print("  Line:      {s}\n", .{if (cfg.channels.line != null) "configured" else "not configured"});
-    try w.print("  QQ:        {s}\n", .{if (cfg.channels.qq.len > 0) "configured" else "not configured"});
-    try w.print("  OneBot:    {s}\n", .{if (cfg.channels.onebot.len > 0) "configured" else "not configured"});
-    try w.print("  MaixCam:   {s}\n", .{if (cfg.channels.maixcam.len > 0) "configured" else "not configured"});
+    for (channel_catalog.known_channels) |meta| {
+        var status_buf: [64]u8 = undefined;
+        const status_text = if (meta.id == .cli)
+            "always"
+        else
+            channel_catalog.statusText(&cfg, meta, &status_buf);
+        try w.print("  {s}: {s}\n", .{ meta.label, status_text });
+    }
 
     try w.flush();
 }
