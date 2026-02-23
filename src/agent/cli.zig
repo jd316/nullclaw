@@ -125,7 +125,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else |_| {}
 
     // Create provider via centralized ProviderHolder (concrete struct lives on the stack)
-    var holder = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, resolved_api_key);
+    var holder = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, resolved_api_key, cfg.getProviderBaseUrl(cfg.default_provider));
     const provider_i: Provider = holder.provider();
 
     const supports_streaming = provider_i.supportsStreaming();

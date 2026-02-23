@@ -86,7 +86,7 @@ pub const ChannelRuntime = struct {
         const holder = try allocator.create(ProviderHolder);
         errdefer allocator.destroy(holder);
 
-        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key);
+        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key, config.getProviderBaseUrl(config.default_provider));
 
         const provider_i = holder.provider();
 

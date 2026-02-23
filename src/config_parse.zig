@@ -1013,6 +1013,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("base_url")) |ab| {
                             if (ab == .string) pe.base_url = try self.allocator.dupe(u8, ab.string);
                         }
+                        // Accept "api_url" as an alias for "base_url" (fallback if base_url wasn't set)
+                        if (pe.base_url == null) {
+                            if (val.object.get("api_url")) |au| {
+                                if (au == .string) pe.base_url = try self.allocator.dupe(u8, au.string);
+                            }
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);
