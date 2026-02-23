@@ -849,12 +849,13 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         }
         std.debug.print("\n", .{});
     }
+    std.debug.print("  Group policy: {s}\n", .{signal_config.group_policy});
     if (signal_config.group_allow_from.len == 0) {
-        std.debug.print("  Allowed groups: (none)\n", .{});
+        std.debug.print("  Group allowed senders: (fallback to allow_from)\n", .{});
     } else if (signal_config.group_allow_from.len == 1 and std.mem.eql(u8, signal_config.group_allow_from[0], "*")) {
-        std.debug.print("  Allowed groups: *\n", .{});
+        std.debug.print("  Group allowed senders: *\n", .{});
     } else {
-        std.debug.print("  Allowed groups:", .{});
+        std.debug.print("  Group allowed senders:", .{});
         for (signal_config.group_allow_from) |g| {
             std.debug.print(" {s}", .{g});
         }
@@ -878,6 +879,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         signal_config.ignore_attachments,
         signal_config.ignore_stories,
     );
+    sg.group_policy = signal_config.group_policy;
 
     // Verify health
     if (!sg.healthCheck()) {

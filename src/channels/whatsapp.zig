@@ -89,10 +89,15 @@ pub const WhatsAppChannel = struct {
                 const value_val = change.object.get("value") orelse continue;
                 if (value_val != .object) continue;
                 const value_obj = value_val.object;
-                const messages = ((value_obj.get("messages")) orelse continue).array.items;
+                const messages_val = value_obj.get("messages") orelse continue;
+                if (messages_val != .array) continue;
+                const messages = messages_val.array.items;
 
                 for (messages) |msg| {
-                    const from_val = msg.object.get("from") orelse continue;
+                    if (msg != .object) continue;
+                    const msg_obj = msg.object;
+
+                    const from_val = msg_obj.get("from") orelse continue;
                     const from = if (from_val == .string) from_val.string else continue;
 
                     // Normalize phone
@@ -103,7 +108,7 @@ pub const WhatsAppChannel = struct {
                     if (!self.isNumberAllowed(normalized)) continue;
 
                     // Check group policy
-                    const is_group_msg = if (msg.object.get("context")) |ctx|
+                    const is_group_msg = if (msg_obj.get("context")) |ctx|
                         if (ctx == .object) (ctx.object.get("group_jid") != null) else false
                     else
                         false;
@@ -116,13 +121,14 @@ pub const WhatsAppChannel = struct {
                     }
 
                     // Extract text only
-                    const text_obj = msg.object.get("text") orelse continue;
+                    const text_obj = msg_obj.get("text") orelse continue;
+                    if (text_obj != .object) continue;
                     const body_val = text_obj.object.get("body") orelse continue;
                     const body = if (body_val == .string) body_val.string else continue;
                     if (body.len == 0) continue;
 
                     // Extract timestamp
-                    const ts_val = msg.object.get("timestamp");
+                    const ts_val = msg_obj.get("timestamp");
                     const timestamp = blk: {
                         if (ts_val) |tv| {
                             if (tv == .string) {
@@ -168,7 +174,9 @@ pub const WhatsAppChannel = struct {
         const value_raw = changes[0].object.get("value") orelse return null;
         if (value_raw != .object) return null;
         const value_obj = value_raw.object;
-        const messages = (value_obj.get("messages") orelse return null).array.items;
+        const messages_val = value_obj.get("messages") orelse return null;
+        if (messages_val != .array) return null;
+        const messages = messages_val.array.items;
         if (messages.len == 0) return null;
         if (messages[0] != .object) return null;
         const msg = messages[0].object;
@@ -439,6 +447,26 @@ test "whatsapp parse missing messages array" {
     const msgs = try ch.parseWebhookPayload(allocator, "{\"entry\":[{\"changes\":[{\"value\":{\"metadata\":{}}}]}]}");
     defer allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "whatsapp parse malformed message types are ignored" {
+    const allocator = std.testing.allocator;
+    const nums = [_][]const u8{"*"};
+    const ch = WhatsAppChannel.init(allocator, "tok", "123", "ver", &nums, &.{}, "allowlist");
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":["not-an-object",{"from":"111","timestamp":"1","type":"text","text":"not-an-object"}]}}]}]}
+    ;
+    const msgs = try ch.parseWebhookPayload(allocator, payload);
+    defer allocator.free(msgs);
+    try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "whatsapp download media malformed messages type returns null" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"entry":[{"changes":[{"value":{"messages":{"id":"oops"}}}]}]}
+    ;
+    try std.testing.expect(WhatsAppChannel.downloadMediaFromPayload(allocator, "tok", payload) == null);
 }
 
 test "whatsapp parse missing from field" {

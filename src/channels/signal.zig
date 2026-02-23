@@ -14,7 +14,8 @@
 //!           "http_url": "http://127.0.0.1:8080",
 //!           "account": "+1234567890",
 //!           "allow_from": ["+1111111111", "uuid:a1b2c3d4-..."],
-//!           "group_allow_from": ["group123"],
+//!           "group_allow_from": ["+1111111111"],
+//!           "group_policy": "allowlist",
 //!           "ignore_attachments": true,
 //!           "ignore_stories": true
 //!         }
@@ -87,8 +88,11 @@ pub const SignalChannel = struct {
     account: []const u8,
     /// Users allowed to interact. Empty = deny all (secure by default).
     allow_from: []const []const u8,
-    /// Groups allowed. Empty = deny all groups / DMs only.
+    /// Senders allowed in group chats when group_policy is allowlist.
+    /// Empty means fallback to allow_from.
     group_allow_from: []const []const u8,
+    /// Group policy: "open" | "allowlist" | "disabled".
+    group_policy: []const u8,
     /// Skip messages that contain only attachments (no text).
     ignore_attachments: bool,
     /// Skip story messages.
@@ -109,6 +113,7 @@ pub const SignalChannel = struct {
             .account = account,
             .allow_from = allow_from,
             .group_allow_from = group_allow_from,
+            .group_policy = "allowlist",
             .ignore_attachments = ignore_attachments,
             .ignore_stories = ignore_stories,
         };
@@ -172,17 +177,12 @@ pub const SignalChannel = struct {
         return false;
     }
 
-    /// Check whether a group is in the allowed groups list.
+    /// Check whether a sender is allowed in group chats.
     ///
-    /// - Empty list = deny all groups (DMs only, secure by default).
-    /// - `*` = allow all groups.
-    pub fn isGroupAllowed(self: *const SignalChannel, group_id: []const u8) bool {
-        if (self.group_allow_from.len == 0) return false;
-        for (self.group_allow_from) |entry| {
-            if (std.mem.eql(u8, entry, "*")) return true;
-            if (std.mem.eql(u8, entry, group_id)) return true;
-        }
-        return false;
+    /// - Empty list = use allow_from fallback for group sender checks.
+    /// - `*` = allow all group senders.
+    pub fn isGroupSenderAllowed(self: *const SignalChannel, sender: []const u8) bool {
+        return root.isAllowed(self.group_allow_from, sender);
     }
 
     // ── Envelope Processing ─────────────────────────────────────────
@@ -219,14 +219,18 @@ pub const SignalChannel = struct {
         const sender_raw = source_number orelse source orelse return null;
         if (sender_raw.len == 0) return null;
 
-        // Allowlist check.
-        if (dm_group_id) |_| {
-            // Group context: check group_allow_from for sender, fall back to allow_from
-            const group_allowed = if (self.group_allow_from.len > 0)
-                root.isAllowed(self.group_allow_from, sender_raw)
-            else
-                self.isSenderAllowed(sender_raw);
-            if (!group_allowed) return null;
+        // Group/DM policy checks.
+        if (dm_group_id != null) {
+            if (std.mem.eql(u8, self.group_policy, "disabled")) return null;
+
+            if (!std.mem.eql(u8, self.group_policy, "open")) {
+                // Allowlist mode: check group_allow_from for sender, fall back to allow_from.
+                const group_allowed = if (self.group_allow_from.len > 0)
+                    self.isGroupSenderAllowed(sender_raw)
+                else
+                    self.isSenderAllowed(sender_raw);
+                if (!group_allowed) return null;
+            }
         } else {
             // DM context: check allow_from
             if (!self.isSenderAllowed(sender_raw)) return null;
@@ -259,7 +263,6 @@ pub const SignalChannel = struct {
         if (text_buf.items.len == 0) return null;
         const text = try text_buf.toOwnedSlice(allocator);
         errdefer allocator.free(text);
-
 
         // Build reply target.
         const reply_target_str = if (dm_group_id) |gid| blk: {
@@ -947,36 +950,36 @@ test "uuid prefix normalization in allowlist" {
     try std.testing.expect(!ch.isSenderAllowed("+9999999999"));
 }
 
-test "group allowlist filtering" {
-    const groups = [_][]const u8{"group123"};
+test "group sender allowlist filtering" {
+    const senders = [_][]const u8{"+15550001111"};
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
         "+1234567890",
         &.{},
-        &groups,
+        &senders,
         true,
         true,
     );
-    try std.testing.expect(ch.isGroupAllowed("group123"));
-    try std.testing.expect(!ch.isGroupAllowed("other_group"));
+    try std.testing.expect(ch.isGroupSenderAllowed("+15550001111"));
+    try std.testing.expect(!ch.isGroupSenderAllowed("+15550002222"));
 }
 
-test "group allowlist wildcard" {
-    const groups = [_][]const u8{"*"};
+test "group sender allowlist wildcard" {
+    const senders = [_][]const u8{"*"};
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
         "+1234567890",
         &.{},
-        &groups,
+        &senders,
         true,
         true,
     );
-    try std.testing.expect(ch.isGroupAllowed("any_group"));
+    try std.testing.expect(ch.isGroupSenderAllowed("+15550001111"));
 }
 
-test "group allowlist empty denies all" {
+test "group sender allowlist empty fallback path has no explicit entries" {
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
@@ -986,23 +989,23 @@ test "group allowlist empty denies all" {
         true,
         true,
     );
-    try std.testing.expect(!ch.isGroupAllowed("any_group"));
+    try std.testing.expect(!ch.isGroupSenderAllowed("+15550001111"));
 }
 
-test "multiple allowed groups" {
-    const groups = [_][]const u8{ "group_a", "group_b" };
+test "multiple allowed group senders" {
+    const senders = [_][]const u8{ "+15550001111", "+15550002222" };
     const ch = SignalChannel.init(
         std.testing.allocator,
         "http://127.0.0.1:8686",
         "+1234567890",
         &.{},
-        &groups,
+        &senders,
         true,
         true,
     );
-    try std.testing.expect(ch.isGroupAllowed("group_a"));
-    try std.testing.expect(ch.isGroupAllowed("group_b"));
-    try std.testing.expect(!ch.isGroupAllowed("group_c"));
+    try std.testing.expect(ch.isGroupSenderAllowed("+15550001111"));
+    try std.testing.expect(ch.isGroupSenderAllowed("+15550002222"));
+    try std.testing.expect(!ch.isGroupSenderAllowed("+15550003333"));
 }
 
 // ── Recipient Target Tests ──────────────────────────────────────────
@@ -1580,8 +1583,8 @@ test "process envelope no source name not set" {
     try std.testing.expect(m.first_name == null);
 }
 
-test "process envelope dm accepted with empty allowed groups" {
-    // Empty group_allow_from = DMs only. DMs should be accepted.
+test "process envelope dm accepted when group_allow_from is empty" {
+    // group_allow_from applies to groups only; DMs are governed by allow_from.
     const users = [_][]const u8{"+1111111111"};
     const ch = SignalChannel.init(
         std.testing.allocator,
@@ -1743,6 +1746,63 @@ test "process envelope group sender not in group_allow_from" {
         &.{},
     );
     try std.testing.expect(msg == null);
+}
+
+test "process envelope group blocked when group_policy disabled" {
+    const users = [_][]const u8{"*"};
+    var ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    ch.group_policy = "disabled";
+    const msg = try ch.processEnvelope(
+        std.testing.allocator,
+        "+1111111111",
+        "+1111111111",
+        null,
+        1000,
+        false,
+        "Hi",
+        1000,
+        "group123",
+        &.{},
+    );
+    try std.testing.expect(msg == null);
+}
+
+test "process envelope group allowed when group_policy open" {
+    const users = [_][]const u8{"+2222222222"};
+    var ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &users,
+        &.{},
+        true,
+        true,
+    );
+    ch.group_policy = "open";
+    const msg = try ch.processEnvelope(
+        std.testing.allocator,
+        "+1111111111",
+        "+1111111111",
+        null,
+        1000,
+        false,
+        "Hi",
+        1000,
+        "group123",
+        &.{},
+    );
+    try std.testing.expect(msg != null);
+    const m = msg.?;
+    defer m.deinit(std.testing.allocator);
+    try std.testing.expect(m.is_group);
 }
 
 test "process envelope uuid sender dm" {

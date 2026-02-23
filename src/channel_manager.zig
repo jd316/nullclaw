@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const bus_mod = @import("bus.zig");
 const Config = @import("config.zig").Config;
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
@@ -17,6 +18,13 @@ const signal_ch = @import("channels/signal.zig");
 const discord = @import("channels/discord.zig");
 const qq = @import("channels/qq.zig");
 const onebot = @import("channels/onebot.zig");
+const slack = @import("channels/slack.zig");
+const matrix = @import("channels/matrix.zig");
+const irc = @import("channels/irc.zig");
+const imessage = @import("channels/imessage.zig");
+const email = @import("channels/email.zig");
+const dingtalk = @import("channels/dingtalk.zig");
+const maixcam = @import("channels/maixcam.zig");
 const whatsapp = @import("channels/whatsapp.zig");
 const line = @import("channels/line.zig");
 const lark = @import("channels/lark.zig");
@@ -33,6 +41,8 @@ pub const ListenerType = enum {
     gateway_loop,
     /// WhatsApp, Line, Lark — HTTP gateway receives
     webhook_only,
+    /// Outbound-only channel lifecycle (start/stop/send, no inbound listener thread yet)
+    send_only,
     /// Channel exists but no listener yet
     not_implemented,
 };
@@ -43,29 +53,12 @@ pub const Entry = struct {
     listener_type: ListenerType,
     supervised: dispatch.SupervisedChannel,
     thread: ?std.Thread = null,
-    loop_state: ?*GenericLoopState = null,
+    polling_state: ?PollingState = null,
 };
 
-/// Generic loop state that replaces TelegramLoopState/SignalLoopState for monitoring.
-pub const GenericLoopState = struct {
-    last_activity: std.atomic.Value(i64),
-    stop_requested: std.atomic.Value(bool),
-    thread: ?std.Thread = null,
-
-    pub fn init() GenericLoopState {
-        return .{
-            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
-            .stop_requested = std.atomic.Value(bool).init(false),
-        };
-    }
-
-    pub fn touch(self: *GenericLoopState) void {
-        self.last_activity.store(std.time.timestamp(), .release);
-    }
-
-    pub fn shouldStop(self: *const GenericLoopState) bool {
-        return self.stop_requested.load(.acquire);
-    }
+pub const PollingState = union(enum) {
+    telegram: *channel_loop.TelegramLoopState,
+    signal: *channel_loop.SignalLoopState,
 };
 
 pub const ChannelManager = struct {
@@ -73,6 +66,7 @@ pub const ChannelManager = struct {
     config: *const Config,
     registry: *dispatch.ChannelRegistry,
     runtime: ?*channel_loop.ChannelRuntime = null,
+    event_bus: ?*bus_mod.Bus = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
     pub fn init(allocator: Allocator, config: *const Config, registry: *dispatch.ChannelRegistry) !*ChannelManager {
@@ -89,19 +83,89 @@ pub const ChannelManager = struct {
         // Stop all threads
         self.stopAll();
 
-        // Free loop states
-        for (self.entries.items) |*entry| {
-            if (entry.loop_state) |ls| {
-                self.allocator.destroy(ls);
-            }
-        }
-
         self.entries.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
     pub fn setRuntime(self: *ChannelManager, rt: *channel_loop.ChannelRuntime) void {
         self.runtime = rt;
+    }
+
+    pub fn setEventBus(self: *ChannelManager, eb: *bus_mod.Bus) void {
+        self.event_bus = eb;
+    }
+
+    fn pollingLastActivity(state: PollingState) i64 {
+        return switch (state) {
+            .telegram => |ls| ls.last_activity.load(.acquire),
+            .signal => |ls| ls.last_activity.load(.acquire),
+        };
+    }
+
+    fn requestPollingStop(state: PollingState) void {
+        switch (state) {
+            .telegram => |ls| ls.stop_requested.store(true, .release),
+            .signal => |ls| ls.stop_requested.store(true, .release),
+        }
+    }
+
+    fn destroyPollingState(self: *ChannelManager, state: PollingState) void {
+        switch (state) {
+            .telegram => |ls| self.allocator.destroy(ls),
+            .signal => |ls| self.allocator.destroy(ls),
+        }
+    }
+
+    fn spawnPollingThread(self: *ChannelManager, entry: *Entry, rt: *channel_loop.ChannelRuntime) !void {
+        if (std.mem.eql(u8, entry.name, "telegram")) {
+            const tg_ls = try self.allocator.create(channel_loop.TelegramLoopState);
+            errdefer self.allocator.destroy(tg_ls);
+            tg_ls.* = channel_loop.TelegramLoopState.init();
+
+            const thread = try std.Thread.spawn(
+                .{ .stack_size = 512 * 1024 },
+                channel_loop.runTelegramLoop,
+                .{ self.allocator, self.config, rt, tg_ls },
+            );
+            tg_ls.thread = thread;
+            entry.polling_state = .{ .telegram = tg_ls };
+            entry.thread = thread;
+            return;
+        }
+
+        if (std.mem.eql(u8, entry.name, "signal")) {
+            const sg_ls = try self.allocator.create(channel_loop.SignalLoopState);
+            errdefer self.allocator.destroy(sg_ls);
+            sg_ls.* = channel_loop.SignalLoopState.init();
+
+            const thread = try std.Thread.spawn(
+                .{ .stack_size = 512 * 1024 },
+                channel_loop.runSignalLoop,
+                .{ self.allocator, self.config, rt, sg_ls },
+            );
+            sg_ls.thread = thread;
+            entry.polling_state = .{ .signal = sg_ls };
+            entry.thread = thread;
+            return;
+        }
+
+        return error.UnsupportedChannel;
+    }
+
+    fn stopPollingThread(self: *ChannelManager, entry: *Entry) void {
+        if (entry.polling_state) |state| {
+            requestPollingStop(state);
+        }
+
+        if (entry.thread) |t| {
+            t.join();
+            entry.thread = null;
+        }
+
+        if (entry.polling_state) |state| {
+            self.destroyPollingState(state);
+            entry.polling_state = null;
+        }
     }
 
     /// Scan config, create channel instances, register in registry.
@@ -138,6 +202,7 @@ pub const ChannelManager = struct {
                 sg_cfg.ignore_attachments,
                 sg_cfg.ignore_stories,
             );
+            sg_ptr.group_policy = sg_cfg.group_policy;
             try self.registry.register(sg_ptr.channel());
             try self.entries.append(self.allocator, .{
                 .name = "signal",
@@ -151,6 +216,7 @@ pub const ChannelManager = struct {
         if (self.config.channels.discord) |dc_cfg| {
             const dc_ptr = try self.allocator.create(discord.DiscordChannel);
             dc_ptr.* = discord.DiscordChannel.initFromConfig(self.allocator, dc_cfg);
+            dc_ptr.bus = self.event_bus;
             try self.registry.register(dc_ptr.channel());
             try self.entries.append(self.allocator, .{
                 .name = "discord",
@@ -165,6 +231,7 @@ pub const ChannelManager = struct {
         if (self.config.channels.qq) |qq_cfg| {
             const qq_ptr = try self.allocator.create(qq.QQChannel);
             qq_ptr.* = qq.QQChannel.init(self.allocator, qq_cfg);
+            if (self.event_bus) |eb| qq_ptr.setBus(eb);
             try self.registry.register(qq_ptr.channel());
             try self.entries.append(self.allocator, .{
                 .name = "qq",
@@ -178,6 +245,7 @@ pub const ChannelManager = struct {
         if (self.config.channels.onebot) |ob_cfg| {
             const ob_ptr = try self.allocator.create(onebot.OneBotChannel);
             ob_ptr.* = onebot.OneBotChannel.init(self.allocator, ob_cfg);
+            if (self.event_bus) |eb| ob_ptr.setBus(eb);
             try self.registry.register(ob_ptr.channel());
             try self.entries.append(self.allocator, .{
                 .name = "onebot",
@@ -241,27 +309,137 @@ pub const ChannelManager = struct {
             });
         }
 
-        // Not-implemented channels: just log
+        // Slack — send-only (outbound ready; inbound listener not wired yet)
         if (self.config.channels.slack != null) {
-            log.info("slack channel configured but no listener implemented yet", .{});
+            const sl_cfg = self.config.channels.slack.?;
+            const sl_ptr = try self.allocator.create(slack.SlackChannel);
+            sl_ptr.* = slack.SlackChannel.init(
+                self.allocator,
+                sl_cfg.bot_token,
+                sl_cfg.app_token,
+                sl_cfg.channel_id,
+                sl_cfg.allow_from,
+            );
+            try self.registry.register(sl_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "slack",
+                .channel = sl_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(sl_ptr.channel(), 5),
+            });
         }
+
+        // Matrix — send-only (outbound ready; inbound listener not wired yet)
         if (self.config.channels.matrix != null) {
-            log.info("matrix channel configured but no listener implemented yet", .{});
+            const mx_cfg = self.config.channels.matrix.?;
+            const mx_ptr = try self.allocator.create(matrix.MatrixChannel);
+            mx_ptr.* = matrix.MatrixChannel.init(
+                self.allocator,
+                mx_cfg.homeserver,
+                mx_cfg.access_token,
+                mx_cfg.room_id,
+                mx_cfg.allow_from,
+            );
+            try self.registry.register(mx_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "matrix",
+                .channel = mx_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(mx_ptr.channel(), 5),
+            });
         }
+
+        // IRC — send-only lifecycle (connect/start for outbound sends)
         if (self.config.channels.irc != null) {
-            log.info("irc channel configured but no listener implemented yet", .{});
+            const irc_cfg = self.config.channels.irc.?;
+            const irc_ptr = try self.allocator.create(irc.IrcChannel);
+            irc_ptr.* = irc.IrcChannel.init(
+                self.allocator,
+                irc_cfg.host,
+                irc_cfg.port,
+                irc_cfg.nick,
+                irc_cfg.username,
+                irc_cfg.channels,
+                irc_cfg.allow_from,
+                irc_cfg.server_password,
+                irc_cfg.nickserv_password,
+                irc_cfg.sasl_password,
+                irc_cfg.tls,
+            );
+            try self.registry.register(irc_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "irc",
+                .channel = irc_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(irc_ptr.channel(), 5),
+            });
         }
+
+        // iMessage — send-only
         if (self.config.channels.imessage != null) {
-            log.info("imessage channel configured but no listener implemented yet", .{});
+            const im_cfg = self.config.channels.imessage.?;
+            const im_ptr = try self.allocator.create(imessage.IMessageChannel);
+            im_ptr.* = imessage.IMessageChannel.init(
+                self.allocator,
+                im_cfg.allow_from,
+                im_cfg.group_allow_from,
+                im_cfg.group_policy,
+            );
+            try self.registry.register(im_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "imessage",
+                .channel = im_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(im_ptr.channel(), 5),
+            });
         }
+
+        // Email — send-only
         if (self.config.channels.email != null) {
-            log.info("email channel configured but no listener implemented yet", .{});
+            const em_cfg = self.config.channels.email.?;
+            const em_ptr = try self.allocator.create(email.EmailChannel);
+            em_ptr.* = email.EmailChannel.init(self.allocator, em_cfg);
+            try self.registry.register(em_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "email",
+                .channel = em_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(em_ptr.channel(), 5),
+            });
         }
+
+        // DingTalk — send-only
         if (self.config.channels.dingtalk != null) {
-            log.info("dingtalk channel configured but no listener implemented yet", .{});
+            const dt_cfg = self.config.channels.dingtalk.?;
+            const dt_ptr = try self.allocator.create(dingtalk.DingTalkChannel);
+            dt_ptr.* = dingtalk.DingTalkChannel.init(
+                self.allocator,
+                dt_cfg.client_id,
+                dt_cfg.client_secret,
+                dt_cfg.allow_from,
+            );
+            try self.registry.register(dt_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "dingtalk",
+                .channel = dt_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(dt_ptr.channel(), 5),
+            });
         }
+
+        // MaixCam — send-only lifecycle (event bus wired for inbound when listener is enabled)
         if (self.config.channels.maixcam != null) {
-            log.info("maixcam channel configured but no listener implemented yet", .{});
+            const mx_cfg = self.config.channels.maixcam.?;
+            const mx_ptr = try self.allocator.create(maixcam.MaixCamChannel);
+            mx_ptr.* = maixcam.MaixCamChannel.init(self.allocator, mx_cfg);
+            mx_ptr.event_bus = self.event_bus;
+            try self.registry.register(mx_ptr.channel());
+            try self.entries.append(self.allocator, .{
+                .name = "maixcam",
+                .channel = mx_ptr.channel(),
+                .listener_type = .send_only,
+                .supervised = dispatch.spawnSupervisedChannel(mx_ptr.channel(), 5),
+            });
         }
     }
 
@@ -277,43 +455,14 @@ pub const ChannelManager = struct {
                         continue;
                     }
 
-                    // Allocate generic loop state for monitoring
-                    const ls = try self.allocator.create(GenericLoopState);
-                    ls.* = GenericLoopState.init();
-                    entry.loop_state = ls;
+                    self.spawnPollingThread(entry, self.runtime.?) catch |err| {
+                        log.err("Failed to spawn {s} thread: {}", .{ entry.name, err });
+                        continue;
+                    };
 
-                    // Spawn appropriate loop
-                    if (std.mem.eql(u8, entry.name, "telegram")) {
-                        const tg_ls = try self.allocator.create(channel_loop.TelegramLoopState);
-                        tg_ls.* = channel_loop.TelegramLoopState.init();
-
-                        entry.thread = std.Thread.spawn(
-                            .{ .stack_size = 512 * 1024 },
-                            channel_loop.runTelegramLoop,
-                            .{ self.allocator, self.config, self.runtime.?, tg_ls },
-                        ) catch |err| {
-                            log.err("Failed to spawn Telegram thread: {}", .{err});
-                            continue;
-                        };
-                    } else if (std.mem.eql(u8, entry.name, "signal")) {
-                        const sg_ls = try self.allocator.create(channel_loop.SignalLoopState);
-                        sg_ls.* = channel_loop.SignalLoopState.init();
-
-                        entry.thread = std.Thread.spawn(
-                            .{ .stack_size = 512 * 1024 },
-                            channel_loop.runSignalLoop,
-                            .{ self.allocator, self.config, self.runtime.?, sg_ls },
-                        ) catch |err| {
-                            log.err("Failed to spawn Signal thread: {}", .{err});
-                            continue;
-                        };
-                    }
-
-                    if (entry.thread != null) {
-                        entry.supervised.recordSuccess();
-                        started += 1;
-                        log.info("{s} polling thread started", .{entry.name});
-                    }
+                    entry.supervised.recordSuccess();
+                    started += 1;
+                    log.info("{s} polling thread started", .{entry.name});
                 },
                 .gateway_loop => {
                     // Gateway-loop channels (Discord, QQ, OneBot) manage their own connections
@@ -333,6 +482,14 @@ pub const ChannelManager = struct {
                     started += 1;
                     log.info("{s} registered (webhook-only)", .{entry.name});
                 },
+                .send_only => {
+                    entry.channel.start() catch |err| {
+                        log.warn("Failed to start {s}: {}", .{ entry.name, err });
+                        continue;
+                    };
+                    started += 1;
+                    log.info("{s} started (send-only)", .{entry.name});
+                },
                 .not_implemented => {
                     log.info("{s} configured but not implemented — skipping", .{entry.name});
                 },
@@ -345,16 +502,10 @@ pub const ChannelManager = struct {
     /// Signal all threads to stop and join them.
     pub fn stopAll(self: *ChannelManager) void {
         for (self.entries.items) |*entry| {
-            if (entry.loop_state) |ls| {
-                ls.stop_requested.store(true, .release);
-            }
-            if (entry.thread) |t| {
-                t.join();
-                entry.thread = null;
-            }
-            // Stop gateway/webhook channels
-            if (entry.listener_type == .gateway_loop or entry.listener_type == .webhook_only) {
-                entry.channel.stop();
+            switch (entry.listener_type) {
+                .polling => self.stopPollingThread(entry),
+                .gateway_loop, .webhook_only, .send_only => entry.channel.stop(),
+                .not_implemented => {},
             }
         }
     }
@@ -372,9 +523,9 @@ pub const ChannelManager = struct {
             for (self.entries.items) |*entry| {
                 if (entry.listener_type != .polling) continue;
 
-                const ls = entry.loop_state orelse continue;
+                const polling_state = entry.polling_state orelse continue;
                 const now = std.time.timestamp();
-                const last = ls.last_activity.load(.acquire);
+                const last = pollingLastActivity(polling_state);
                 const stale = (now - last) > STALE_THRESHOLD_SECS;
 
                 const probe_ok = entry.channel.healthCheck();
@@ -395,46 +546,20 @@ pub const ChannelManager = struct {
                         state.markError("channels", reason);
 
                         // Stop old thread
-                        ls.stop_requested.store(true, .release);
-                        if (entry.thread) |t| t.join();
+                        self.stopPollingThread(entry);
 
                         // Backoff
                         std.Thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
 
                         // Respawn
-                        ls.stop_requested.store(false, .release);
-                        ls.last_activity.store(std.time.timestamp(), .release);
-
                         if (self.runtime) |rt| {
-                            if (std.mem.eql(u8, entry.name, "telegram")) {
-                                const tg_ls = self.allocator.create(channel_loop.TelegramLoopState) catch continue;
-                                tg_ls.* = channel_loop.TelegramLoopState.init();
-                                entry.thread = std.Thread.spawn(
-                                    .{ .stack_size = 512 * 1024 },
-                                    channel_loop.runTelegramLoop,
-                                    .{ self.allocator, self.config, rt, tg_ls },
-                                ) catch |err| {
-                                    log.err("Failed to respawn Telegram thread: {}", .{err});
-                                    continue;
-                                };
-                            } else if (std.mem.eql(u8, entry.name, "signal")) {
-                                const sg_ls = self.allocator.create(channel_loop.SignalLoopState) catch continue;
-                                sg_ls.* = channel_loop.SignalLoopState.init();
-                                entry.thread = std.Thread.spawn(
-                                    .{ .stack_size = 512 * 1024 },
-                                    channel_loop.runSignalLoop,
-                                    .{ self.allocator, self.config, rt, sg_ls },
-                                ) catch |err| {
-                                    log.err("Failed to respawn Signal thread: {}", .{err});
-                                    continue;
-                                };
-                            }
-
-                            if (entry.thread != null) {
-                                entry.supervised.recordSuccess();
-                                state.markRunning("channels");
-                                health.markComponentOk(entry.name);
-                            }
+                            self.spawnPollingThread(entry, rt) catch |err| {
+                                log.err("Failed to respawn {s} thread: {}", .{ entry.name, err });
+                                continue;
+                            };
+                            entry.supervised.recordSuccess();
+                            state.markRunning("channels");
+                            health.markComponentOk(entry.name);
                         }
                     } else if (entry.supervised.state == .gave_up) {
                         state.markError("channels", "gave up after max restarts");
@@ -468,27 +593,9 @@ pub const ChannelManager = struct {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "GenericLoopState init defaults" {
-    const ls = GenericLoopState.init();
-    try std.testing.expect(!ls.shouldStop());
-    try std.testing.expect(ls.thread == null);
-    try std.testing.expect(ls.last_activity.load(.acquire) > 0);
-}
-
-test "GenericLoopState stop_requested toggle" {
-    var ls = GenericLoopState.init();
-    try std.testing.expect(!ls.shouldStop());
-    ls.stop_requested.store(true, .release);
-    try std.testing.expect(ls.shouldStop());
-}
-
-test "GenericLoopState touch updates timestamp" {
-    var ls = GenericLoopState.init();
-    const before = ls.last_activity.load(.acquire);
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    ls.touch();
-    const after = ls.last_activity.load(.acquire);
-    try std.testing.expect(after >= before);
+test "PollingState has telegram and signal variants" {
+    try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
+        @intFromEnum(@as(std.meta.Tag(PollingState), .signal)));
 }
 
 test "ListenerType enum values distinct" {

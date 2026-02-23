@@ -144,11 +144,17 @@ pub const LineChannel = struct {
             // Source
             const source_obj = event.object.get("source");
             var user_id: ?[]const u8 = null;
+            var group_id: ?[]const u8 = null;
+            var room_id: ?[]const u8 = null;
             var source_type: ?[]const u8 = null;
             if (source_obj) |src| {
                 if (src == .object) {
                     const uid_val = src.object.get("userId");
                     user_id = if (uid_val) |u| (if (u == .string) u.string else null) else null;
+                    const gid_val = src.object.get("groupId");
+                    group_id = if (gid_val) |g| (if (g == .string) g.string else null) else null;
+                    const rid_val = src.object.get("roomId");
+                    room_id = if (rid_val) |r| (if (r == .string) r.string else null) else null;
                     const st_val = src.object.get("type");
                     source_type = if (st_val) |s| (if (s == .string) s.string else null) else null;
                 }
@@ -188,6 +194,8 @@ pub const LineChannel = struct {
                 .event_type = try allocator.dupe(u8, event_type),
                 .reply_token = if (reply_token) |rt| try allocator.dupe(u8, rt) else null,
                 .user_id = if (user_id) |uid| try allocator.dupe(u8, uid) else null,
+                .group_id = if (group_id) |gid| try allocator.dupe(u8, gid) else null,
+                .room_id = if (room_id) |rid| try allocator.dupe(u8, rid) else null,
                 .source_type = if (source_type) |st| try allocator.dupe(u8, st) else null,
                 .message_type = if (message_type) |mt| try allocator.dupe(u8, mt) else null,
                 .message_text = if (message_text) |mt| try allocator.dupe(u8, mt) else null,
@@ -281,6 +289,8 @@ pub const LineEvent = struct {
     event_type: []const u8,
     reply_token: ?[]const u8 = null,
     user_id: ?[]const u8 = null,
+    group_id: ?[]const u8 = null,
+    room_id: ?[]const u8 = null,
     source_type: ?[]const u8 = null,
     message_type: ?[]const u8 = null,
     message_text: ?[]const u8 = null,
@@ -291,6 +301,8 @@ pub const LineEvent = struct {
         allocator.free(self.event_type);
         if (self.reply_token) |rt| allocator.free(rt);
         if (self.user_id) |uid| allocator.free(uid);
+        if (self.group_id) |gid| allocator.free(gid);
+        if (self.room_id) |rid| allocator.free(rid);
         if (self.source_type) |st| allocator.free(st);
         if (self.message_type) |mt| allocator.free(mt);
         if (self.message_text) |mt| allocator.free(mt);
@@ -639,7 +651,7 @@ test "line parse multiple events" {
 test "line parse group source" {
     const allocator = std.testing.allocator;
     const payload =
-        \\{"events":[{"type":"message","replyToken":"grp_tok","source":{"type":"group","userId":"Uuser1"},"timestamp":1700000000000,"message":{"id":"gm1","type":"text","text":"Group msg"}}]}
+        \\{"events":[{"type":"message","replyToken":"grp_tok","source":{"type":"group","groupId":"G123","userId":"Uuser1"},"timestamp":1700000000000,"message":{"id":"gm1","type":"text","text":"Group msg"}}]}
     ;
 
     const events = try LineChannel.parseWebhookEvents(allocator, payload);
@@ -653,13 +665,15 @@ test "line parse group source" {
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("group", events[0].source_type.?);
+    try std.testing.expectEqualStrings("G123", events[0].group_id.?);
+    try std.testing.expect(events[0].room_id == null);
     try std.testing.expectEqualStrings("Group msg", events[0].message_text.?);
 }
 
 test "line parse room source" {
     const allocator = std.testing.allocator;
     const payload =
-        \\{"events":[{"type":"message","replyToken":"room_tok","source":{"type":"room","userId":"Uroom_user"},"timestamp":1700000000000,"message":{"id":"rm1","type":"text","text":"Room msg"}}]}
+        \\{"events":[{"type":"message","replyToken":"room_tok","source":{"type":"room","roomId":"R987","userId":"Uroom_user"},"timestamp":1700000000000,"message":{"id":"rm1","type":"text","text":"Room msg"}}]}
     ;
 
     const events = try LineChannel.parseWebhookEvents(allocator, payload);
@@ -673,6 +687,8 @@ test "line parse room source" {
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("room", events[0].source_type.?);
+    try std.testing.expectEqualStrings("R987", events[0].room_id.?);
+    try std.testing.expect(events[0].group_id == null);
 }
 
 test "line parse message without source userId" {

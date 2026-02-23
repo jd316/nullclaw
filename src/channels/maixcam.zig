@@ -306,6 +306,7 @@ pub const MaixCamChannel = struct {
             log.debug("failed to parse device message", .{});
             return;
         };
+        defer event.deinit(self.allocator);
 
         // Check allowlist
         if (!self.isDeviceAllowed(event.device_id)) {
@@ -331,13 +332,23 @@ pub const MaixCamChannel = struct {
 
         // Publish to bus
         if (self.event_bus) |b| {
-            const msg = bus.makeInbound(
+            var meta_buf: [128]u8 = undefined;
+            var meta_fbs = std.io.fixedBufferStream(&meta_buf);
+            const mw = meta_fbs.writer();
+            mw.writeAll("{\"account_id\":") catch return;
+            root.appendJsonStringW(mw, self.config.account_id) catch return;
+            mw.writeByte('}') catch return;
+            const metadata = meta_fbs.getWritten();
+
+            const msg = bus.makeInboundFull(
                 self.allocator,
                 self.config.name,
                 event.device_id,
                 event.device_id,
                 content,
                 session_key,
+                &.{},
+                metadata,
             ) catch {
                 log.err("failed to create inbound message", .{});
                 return;

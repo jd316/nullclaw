@@ -22,6 +22,15 @@ const signal = @import("channels/signal.zig");
 
 const log = std.log.scoped(.channel_loop);
 
+fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
+    const target = reply_target orelse "unknown";
+    if (std.mem.startsWith(u8, target, signal.GROUP_TARGET_PREFIX)) {
+        const raw = target[signal.GROUP_TARGET_PREFIX.len..];
+        if (raw.len > 0) return raw;
+    }
+    return target;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // TelegramLoopState — shared state between supervisor and polling thread
 // ════════════════════════════════════════════════════════════════════════════
@@ -51,6 +60,7 @@ pub const ProviderHolder = providers.ProviderHolder;
 
 pub const ChannelRuntime = struct {
     allocator: std.mem.Allocator,
+    config: *const Config,
     session_mgr: session_mod.SessionManager,
     provider_holder: *ProviderHolder,
     tools: []const tools_mod.Tool,
@@ -118,6 +128,7 @@ pub const ChannelRuntime = struct {
         const self = try allocator.create(ChannelRuntime);
         self.* = .{
             .allocator = allocator,
+            .config = config,
             .session_mgr = session_mgr,
             .provider_holder = holder,
             .tools = tools,
@@ -212,18 +223,18 @@ pub fn runTelegramLoop(
             const use_reply_to = msg.is_group or telegram_config.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
-            // Session key — use agent routing if bindings are configured
+            // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
             const session_key = blk: {
-                if (config.agent_bindings.len > 0) {
-                    const route = agent_routing.resolveRoute(allocator, .{
-                        .channel = "telegram",
-                        .account_id = "default",
-                        .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
-                    }, config.agent_bindings, config.agents) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
-                    break :blk route.session_key;
-                }
-                break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+                const route = agent_routing.resolveRoute(allocator, .{
+                    .channel = "telegram",
+                    .account_id = telegram_config.account_id,
+                    .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
+                }, config.agent_bindings, config.agents) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
             };
 
             // Typing indicator
@@ -324,6 +335,7 @@ pub fn runSignalLoop(
         signal_config.ignore_attachments,
         signal_config.ignore_stories,
     );
+    sg_ptr.group_policy = signal_config.group_policy;
 
     // Update activity timestamp at start
     loop_state.last_activity.store(std.time.timestamp(), .release);
@@ -342,27 +354,28 @@ pub fn runSignalLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
-            // Session key — use agent routing if bindings are configured
+            // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
+            const group_peer_id = signalGroupPeerId(msg.reply_target);
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
             const session_key = blk: {
-                if (config.agent_bindings.len > 0) {
-                    const route = agent_routing.resolveRoute(allocator, .{
-                        .channel = "signal",
-                        .account_id = "default",
-                        .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
-                    }, config.agent_bindings, config.agents) catch break :blk if (msg.is_group)
-                        std.fmt.bufPrint(&key_buf, "signal:group:{s}:{s}", .{ msg.reply_target orelse "unknown", msg.sender }) catch msg.sender
-                    else
-                        std.fmt.bufPrint(&key_buf, "signal:{s}", .{msg.sender}) catch msg.sender;
-                    break :blk route.session_key;
-                }
-                break :blk if (msg.is_group)
+                const route = agent_routing.resolveRoute(allocator, .{
+                    .channel = "signal",
+                    .account_id = signal_config.account_id,
+                    .peer = .{
+                        .kind = if (msg.is_group) .group else .direct,
+                        .id = if (msg.is_group) group_peer_id else msg.sender,
+                    },
+                }, config.agent_bindings, config.agents) catch break :blk if (msg.is_group)
                     std.fmt.bufPrint(&key_buf, "signal:group:{s}:{s}", .{
-                        msg.reply_target orelse "unknown",
+                        group_peer_id,
                         msg.sender,
                     }) catch msg.sender
                 else
                     std.fmt.bufPrint(&key_buf, "signal:{s}", .{msg.sender}) catch msg.sender;
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
             };
 
             // Send typing indicator (best-effort)

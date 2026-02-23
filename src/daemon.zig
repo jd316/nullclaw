@@ -15,6 +15,7 @@ const bus_mod = @import("bus.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
+const agent_routing = @import("agent_routing.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -222,6 +223,7 @@ fn channelSupervisorThread(
     state: *DaemonState,
     channel_registry: *dispatch.ChannelRegistry,
     channel_rt: ?*channel_loop.ChannelRuntime,
+    event_bus: *bus_mod.Bus,
 ) void {
     var mgr = channel_manager.ChannelManager.init(allocator, config, channel_registry) catch {
         state.markError("channels", "init_failed");
@@ -231,6 +233,7 @@ fn channelSupervisorThread(
     defer mgr.deinit();
 
     if (channel_rt) |rt| mgr.setRuntime(rt);
+    mgr.setEventBus(event_bus);
 
     mgr.collectConfiguredChannels() catch |err| {
         state.markError("channels", @errorName(err));
@@ -250,6 +253,138 @@ fn channelSupervisorThread(
         mgr.supervisionLoop(state); // blocks until shutdown
     } else {
         health.markComponentOk("channels");
+    }
+}
+
+/// Inbound dispatcher thread:
+/// consumes inbound events from channels, runs SessionManager, publishes outbound replies.
+fn resolveInboundRouteSessionKey(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+) ?[]const u8 {
+    var account_id: []const u8 = "default";
+    var has_account_id_meta = false;
+    var peer: ?agent_routing.PeerRef = null;
+    var guild_id: ?[]const u8 = null;
+    var is_dm_meta: ?bool = null;
+    var is_group_meta: ?bool = null;
+    var channel_id_meta: ?[]const u8 = null;
+    const maixcam_name = if (config.channels.maixcam) |mc| mc.name else "maixcam";
+
+    var parsed_meta: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_meta) |*pm| pm.deinit();
+    if (msg.metadata_json) |meta_json| {
+        parsed_meta = std.json.parseFromSlice(std.json.Value, allocator, meta_json, .{}) catch null;
+        if (parsed_meta) |*pm| {
+            if (pm.value == .object) {
+                if (pm.value.object.get("account_id") orelse pm.value.object.get("accountId")) |v| {
+                    if (v == .string) {
+                        account_id = v.string;
+                        has_account_id_meta = true;
+                    }
+                }
+                if (pm.value.object.get("guild_id") orelse pm.value.object.get("guildId")) |v| {
+                    if (v == .string) guild_id = v.string;
+                }
+                if (pm.value.object.get("channel_id")) |v| {
+                    if (v == .string) channel_id_meta = v.string;
+                }
+                if (pm.value.object.get("is_dm")) |v| {
+                    if (v == .bool) is_dm_meta = v.bool;
+                }
+                if (pm.value.object.get("is_group")) |v| {
+                    if (v == .bool) is_group_meta = v.bool;
+                }
+            }
+        }
+    }
+
+    if (!has_account_id_meta) {
+        if (std.mem.eql(u8, msg.channel, "discord")) {
+            if (config.channels.discord) |dc| account_id = dc.account_id;
+        } else if (std.mem.eql(u8, msg.channel, "qq")) {
+            if (config.channels.qq) |qc| account_id = qc.account_id;
+        } else if (std.mem.eql(u8, msg.channel, "onebot")) {
+            if (config.channels.onebot) |oc| account_id = oc.account_id;
+        } else if (std.mem.eql(u8, msg.channel, "maixcam") or std.mem.eql(u8, msg.channel, maixcam_name)) {
+            if (config.channels.maixcam) |mc| account_id = mc.account_id;
+        }
+    }
+
+    if (std.mem.eql(u8, msg.channel, "discord")) {
+        const is_dm = is_dm_meta orelse (guild_id == null);
+        peer = .{
+            .kind = if (is_dm) .direct else .channel,
+            .id = if (is_dm) msg.sender_id else msg.chat_id,
+        };
+    } else if (std.mem.eql(u8, msg.channel, "qq")) {
+        const is_dm = is_dm_meta orelse std.mem.startsWith(u8, msg.chat_id, "dm:");
+        const raw_channel = channel_id_meta orelse msg.chat_id;
+        const channel_id = if (std.mem.startsWith(u8, raw_channel, "channel:"))
+            raw_channel["channel:".len..]
+        else
+            raw_channel;
+        peer = .{
+            .kind = if (is_dm) .direct else .channel,
+            .id = if (is_dm) msg.sender_id else channel_id,
+        };
+    } else if (std.mem.eql(u8, msg.channel, "onebot")) {
+        if (std.mem.startsWith(u8, msg.chat_id, "group:")) {
+            peer = .{ .kind = .group, .id = msg.chat_id["group:".len..] };
+        } else if (is_group_meta orelse false) {
+            peer = .{ .kind = .group, .id = msg.chat_id };
+        } else {
+            peer = .{ .kind = .direct, .id = msg.sender_id };
+        }
+    } else if (std.mem.eql(u8, msg.channel, "maixcam") or std.mem.eql(u8, msg.channel, maixcam_name)) {
+        peer = .{ .kind = .direct, .id = msg.chat_id };
+    } else {
+        return null;
+    }
+
+    const route = agent_routing.resolveRoute(allocator, .{
+        .channel = msg.channel,
+        .account_id = account_id,
+        .peer = peer,
+        .guild_id = guild_id,
+    }, config.agent_bindings, config.agents) catch return null;
+    return route.session_key;
+}
+
+fn inboundDispatcherThread(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    runtime: *channel_loop.ChannelRuntime,
+    state: *DaemonState,
+) void {
+    while (event_bus.consumeInbound()) |msg| {
+        defer msg.deinit(allocator);
+
+        const routed_session_key = resolveInboundRouteSessionKey(allocator, runtime.config, &msg);
+        defer if (routed_session_key) |key| allocator.free(key);
+        const session_key = routed_session_key orelse msg.session_key;
+
+        const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+            log.warn("inbound dispatch process failed: {}", .{err});
+            continue;
+        };
+        defer allocator.free(reply);
+
+        const out = bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply) catch |err| {
+            log.err("inbound dispatch makeOutbound failed: {}", .{err});
+            continue;
+        };
+
+        event_bus.publishOutbound(out) catch |err| {
+            out.deinit(allocator);
+            if (err == error.Closed) break;
+            log.err("inbound dispatch publishOutbound failed: {}", .{err});
+            continue;
+        };
+
+        state.markRunning("inbound_dispatcher");
+        health.markComponentOk("inbound_dispatcher");
     }
 }
 
@@ -350,7 +485,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var chan_thread: ?std.Thread = null;
     if (hasSupervisedChannels(config)) {
         if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
-            allocator, config, &state, &channel_registry, channel_rt,
+            allocator, config, &state, &channel_registry, channel_rt, &event_bus,
         })) |thread| {
             chan_thread = thread;
         } else |err| {
@@ -358,6 +493,22 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
             stdout.print("Warning: channel supervisor thread failed: {}\n", .{err}) catch {};
         }
     }
+
+    var inbound_thread: ?std.Thread = null;
+    if (channel_rt) |rt| {
+        state.addComponent("inbound_dispatcher");
+        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
+            allocator, &event_bus, rt, &state,
+        })) |thread| {
+            inbound_thread = thread;
+            state.markRunning("inbound_dispatcher");
+            health.markComponentOk("inbound_dispatcher");
+        } else |err| {
+            state.markError("inbound_dispatcher", @errorName(err));
+            stdout.print("Warning: inbound dispatcher thread failed: {}\n", .{err}) catch {};
+        }
+    }
+
     var dispatch_stats = dispatch.DispatchStats{};
 
     state.addComponent("outbound_dispatcher");
@@ -389,6 +540,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     writeStateFile(allocator, state_path, &state) catch {};
 
     // Wait for threads
+    if (inbound_thread) |t| t.join();
     if (dispatcher_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
@@ -439,6 +591,81 @@ test "hasSupervisedChannels false for defaults" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expect(!hasSupervisedChannels(&config));
+}
+
+test "resolveInboundRouteSessionKey falls back to configured account_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "onebot-agent",
+            .match = .{
+                .channel = "onebot",
+                .account_id = "onebot-main",
+                .peer = .{ .kind = .direct, .id = "12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .onebot = .{
+                .account_id = "onebot-main",
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "onebot",
+        .sender_id = "12345",
+        .chat_id = "12345",
+        .content = "hello",
+        .session_key = "onebot:12345",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:onebot-agent:onebot:direct:12345", routed.?);
+}
+
+test "resolveInboundRouteSessionKey supports custom maixcam channel name" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "camera-agent",
+            .match = .{
+                .channel = "vision-cam",
+                .account_id = "cam-main",
+                .peer = .{ .kind = .direct, .id = "device-1" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .maixcam = .{
+                .name = "vision-cam",
+                .account_id = "cam-main",
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "vision-cam",
+        .sender_id = "device-1",
+        .chat_id = "device-1",
+        .content = "person detected",
+        .session_key = "vision-cam:device-1",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:camera-agent:vision-cam:direct:device-1", routed.?);
 }
 
 test "stateFilePath derives from config_path" {
@@ -495,9 +722,10 @@ test "channelSupervisorThread respects shutdown" {
 
     var channel_registry = dispatch.ChannelRegistry.init(std.testing.allocator);
     defer channel_registry.deinit();
+    var event_bus = bus_mod.Bus.init();
 
     const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
-        std.testing.allocator, &config, &state, &channel_registry, null,
+        std.testing.allocator, &config, &state, &channel_registry, null, &event_bus,
     });
     thread.join();
 

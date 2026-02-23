@@ -250,8 +250,11 @@ pub const OneBotChannel = struct {
 
         // Extract chat_id (group_id for group messages, user_id for private)
         const chat_id_int = if (is_group) getJsonInt(val, "group_id") orelse return else user_id;
-        var chat_buf: [32]u8 = undefined;
-        const chat_str = std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id_int}) catch return;
+        var chat_buf: [48]u8 = undefined;
+        const chat_str = if (is_group)
+            std.fmt.bufPrint(&chat_buf, "group:{d}", .{chat_id_int}) catch return
+        else
+            std.fmt.bufPrint(&chat_buf, "{d}", .{chat_id_int}) catch return;
 
         // Extract raw message text
         const raw_message = getJsonString(val, "raw_message") orelse
@@ -291,6 +294,8 @@ pub const OneBotChannel = struct {
             message_id,
             if (is_group) "true" else "false",
         }) catch return;
+        mw.writeAll(",\"account_id\":") catch return;
+        root.appendJsonStringW(mw, self.config.account_id) catch return;
         if (cq.reply_id) |rid| {
             mw.writeAll(",\"reply_to\":\"") catch return;
             mw.writeAll(rid) catch return;
@@ -661,7 +666,7 @@ test "handleEvent private message" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = OneBotChannel.init(alloc, .{});
+    var ch = OneBotChannel.init(alloc, .{ .account_id = "onebot-main" });
     ch.setBus(&event_bus_inst);
     ch.running = true;
 
@@ -678,6 +683,8 @@ test "handleEvent private message" {
     try std.testing.expectEqualStrings("12345", msg.chat_id);
     try std.testing.expectEqualStrings("hello onebot", msg.content);
     try std.testing.expectEqualStrings("onebot:12345", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"account_id\":\"onebot-main\"") != null);
 }
 
 test "handleEvent group message with prefix" {
@@ -701,7 +708,8 @@ test "handleEvent group message with prefix" {
     var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("what is Zig?", msg.content);
-    try std.testing.expectEqualStrings("999", msg.chat_id);
+    try std.testing.expectEqualStrings("group:999", msg.chat_id);
+    try std.testing.expectEqualStrings("onebot:group:999", msg.session_key);
 }
 
 test "handleEvent group message without prefix skipped" {

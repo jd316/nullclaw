@@ -13,6 +13,7 @@ pub const DiscordChannel = struct {
     token: []const u8,
     guild_id: ?[]const u8,
     allow_bots: bool,
+    account_id: []const u8 = "default",
 
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
@@ -55,6 +56,7 @@ pub const DiscordChannel = struct {
             .token = cfg.token,
             .guild_id = cfg.guild_id,
             .allow_bots = cfg.allow_bots,
+            .account_id = cfg.account_id,
             .allow_from = cfg.allow_from,
             .require_mention = cfg.require_mention,
             .intents = cfg.intents,
@@ -709,6 +711,18 @@ pub const DiscordChannel = struct {
         const session_key = try std.fmt.allocPrint(self.allocator, "discord:{s}", .{channel_id});
         defer self.allocator.free(session_key);
 
+        var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer metadata_buf.deinit(self.allocator);
+        const mw = metadata_buf.writer(self.allocator);
+        try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
+        try mw.writeAll(",\"account_id\":");
+        try root.appendJsonStringW(mw, self.account_id);
+        if (guild_id) |gid| {
+            try mw.writeAll(",\"guild_id\":");
+            try root.appendJsonStringW(mw, gid);
+        }
+        try mw.writeByte('}');
+
         const msg = try bus_mod.makeInboundFull(
             self.allocator,
             "discord",
@@ -717,7 +731,7 @@ pub const DiscordChannel = struct {
             final_content,
             session_key,
             &.{},
-            null,
+            metadata_buf.items,
         );
 
         if (self.bus) |b| {
@@ -888,6 +902,7 @@ test "discord intents default" {
 test "discord initFromConfig passes all fields" {
     const config_types = @import("../config_types.zig");
     const cfg = config_types.DiscordConfig{
+        .account_id = "discord-main",
         .token = "my-token",
         .guild_id = "guild-1",
         .allow_bots = true,
@@ -899,6 +914,7 @@ test "discord initFromConfig passes all fields" {
     try std.testing.expectEqualStrings("my-token", ch.token);
     try std.testing.expectEqualStrings("guild-1", ch.guild_id.?);
     try std.testing.expect(ch.allow_bots);
+    try std.testing.expectEqualStrings("discord-main", ch.account_id);
     try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
     try std.testing.expect(ch.require_mention);
     try std.testing.expectEqual(@as(u32, 512), ch.intents);

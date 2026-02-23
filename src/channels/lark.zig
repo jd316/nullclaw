@@ -152,6 +152,7 @@ pub const LarkChannel = struct {
             .sender = try allocator.dupe(u8, chat_id),
             .content = try allocator.dupe(u8, text),
             .timestamp = timestamp,
+            .is_group = std.mem.eql(u8, chat_type, "group"),
         });
 
         return result.toOwnedSlice(allocator);
@@ -374,6 +375,7 @@ pub const ParsedLarkMessage = struct {
     sender: []const u8,
     content: []const u8,
     timestamp: u64,
+    is_group: bool = false,
 
     pub fn deinit(self: *ParsedLarkMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.sender);
@@ -531,6 +533,29 @@ test "lark parse valid text message" {
     try std.testing.expectEqualStrings("Hello nullclaw!", msgs[0].content);
     try std.testing.expectEqualStrings("oc_chat123", msgs[0].sender);
     try std.testing.expectEqual(@as(u64, 1_699_999_999), msgs[0].timestamp);
+    try std.testing.expect(!msgs[0].is_group);
+}
+
+test "lark parse group message marks is_group" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_group_user"}},"message":{"message_type":"text","content":"{\"text\":\"hello group\"}","chat_type":"group","mentions":[{"key":"@_user_1"}],"chat_id":"oc_group_1","create_time":"1000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expect(msgs[0].is_group);
 }
 
 test "lark parse unauthorized user" {
