@@ -155,10 +155,13 @@ pub fn parseAttachmentMarkers(allocator: std.mem.Allocator, text: []const u8) !P
     // Trim whitespace from remaining text
     const trimmed = std.mem.trim(u8, remaining.items, " \t\n\r");
     const remaining_owned = try allocator.dupe(u8, trimmed);
+    errdefer allocator.free(remaining_owned);
+
+    const final_attachments = try attachments.toOwnedSlice(allocator);
     remaining.deinit(allocator);
 
     return .{
-        .attachments = try attachments.toOwnedSlice(allocator),
+        .attachments = final_attachments,
         .remaining_text = remaining_owned,
     };
 }
@@ -233,6 +236,12 @@ pub const TelegramChannel = struct {
     transcriber: ?voice.Transcriber = null,
     last_update_id: i64,
     proxy: ?[]const u8,
+
+    // Pending media group messages (buffered across poll cycles until group is complete)
+    pending_media_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
+    pending_media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty,
+    /// Epoch seconds after which pending media groups should be flushed (0 = no pending)
+    media_group_deadline: u64 = 0,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
 
@@ -667,10 +676,22 @@ pub const TelegramChannel = struct {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, "getUpdates");
 
-        // Build body with offset and timeout
+        // Build body with offset and dynamic timeout.
+        // If a media group deadline is pending, cap the timeout so we flush promptly.
+        var poll_timeout: u64 = 30;
+        {
+            const t_now = root.nowEpochSecs();
+            if (self.media_group_deadline > 0) {
+                if (t_now >= self.media_group_deadline) {
+                    poll_timeout = 0; // Deadline already passed — return immediately
+                } else {
+                    poll_timeout = @min(30, self.media_group_deadline - t_now);
+                }
+            }
+        }
         var body_buf: [256]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&body_buf);
-        try fbs.writer().print("{{\"offset\":{d},\"timeout\":30,\"allowed_updates\":[\"message\"]}}", .{self.last_update_id});
+        try fbs.writer().print("{{\"offset\":{d},\"timeout\":{d},\"allowed_updates\":[\"message\"]}}", .{ self.last_update_id, poll_timeout });
         const body = fbs.getWritten();
 
         const resp_body = try root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, null);
@@ -686,177 +707,375 @@ pub const TelegramChannel = struct {
         const result_array = result_val.array.items;
 
         var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
-        errdefer messages.deinit(allocator);
+        // Track media_group_id per message for post-loop merging
+        var media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        errdefer {
+            for (messages.items) |msg| {
+                allocator.free(msg.id);
+                allocator.free(msg.sender);
+                allocator.free(msg.content);
+                if (msg.first_name) |fn_| allocator.free(fn_);
+            }
+            messages.deinit(allocator);
+            for (media_group_ids.items) |mg| if (mg) |s| allocator.free(s);
+            media_group_ids.deinit(allocator);
+        }
+
+        // ── Flush matured pending media groups ─────────────────────────
+        // Before processing new updates, check if any buffered media groups
+        // have passed their deadline — if so, merge and prepend to output.
+        const now = root.nowEpochSecs();
+        if (self.media_group_deadline > 0 and now >= self.media_group_deadline) {
+            // Merge pending groups
+            mergeMediaGroups(allocator, &self.pending_media_messages, &self.pending_media_group_ids);
+
+            // Move all pending messages to output (messages array is empty at this point)
+            for (self.pending_media_messages.items) |pmsg| {
+                messages.append(allocator, pmsg) catch {
+                    // On OOM, free the message we couldn't insert
+                    allocator.free(pmsg.id);
+                    allocator.free(pmsg.sender);
+                    allocator.free(pmsg.content);
+                    if (pmsg.first_name) |fn_| allocator.free(fn_);
+                    continue;
+                };
+                media_group_ids.append(allocator, null) catch {
+                    // Rollback to keep arrays synchronized
+                    const popped = messages.pop().?;
+                    allocator.free(popped.id);
+                    allocator.free(popped.sender);
+                    allocator.free(popped.content);
+                    if (popped.first_name) |fn_| allocator.free(fn_);
+                };
+            }
+            // Free pending group ID strings and clear buffers
+            for (self.pending_media_group_ids.items) |mg| if (mg) |s| allocator.free(s);
+            self.pending_media_messages.clearRetainingCapacity();
+            self.pending_media_group_ids.clearRetainingCapacity();
+            self.media_group_deadline = 0;
+        }
 
         for (result_array) |update| {
-            if (update != .object) continue;
-            // Advance offset
-            if (update.object.get("update_id")) |uid| {
-                if (uid == .integer) {
-                    self.last_update_id = uid.integer + 1;
-                }
-            }
+            self.processUpdate(allocator, update, &messages, &media_group_ids);
+        }
 
-            const message = update.object.get("message") orelse continue;
-            if (message != .object) continue;
+        // ── Route media group items to pending buffer ────────────────
+        // Messages with a media_group_id are moved to the persistent pending
+        // buffer instead of being returned immediately. This avoids blocking
+        // and allows subsequent poll cycles to collect remaining group items.
+        {
+            var added_to_pending = false;
+            var i: usize = 0;
+            while (i < messages.items.len) {
+                if (media_group_ids.items[i] != null) {
+                    // Transfer ownership: remove from local arrays, move to pending buffer
+                    const msg = messages.orderedRemove(i);
+                    const mgid_opt = media_group_ids.orderedRemove(i);
 
-            // Get sender info — check both @username and numeric user_id
-            const from_obj = message.object.get("from") orelse continue;
-            if (from_obj != .object) continue;
-            const username_val = from_obj.object.get("username");
-            const username = if (username_val) |uv| (if (uv == .string) uv.string else "unknown") else "unknown";
-
-            var user_id_buf: [32]u8 = undefined;
-            const user_id: ?[]const u8 = blk_uid: {
-                const id_val = from_obj.object.get("id") orelse break :blk_uid null;
-                if (id_val != .integer) break :blk_uid null;
-                break :blk_uid std.fmt.bufPrint(&user_id_buf, "{d}", .{id_val.integer}) catch null;
-            };
-
-            // Get chat_id and chat type
-            const chat_obj = message.object.get("chat") orelse continue;
-            if (chat_obj != .object) continue;
-            const chat_id_val = chat_obj.object.get("id") orelse continue;
-            var chat_id_buf: [32]u8 = undefined;
-            const chat_id_str = blk: {
-                if (chat_id_val == .integer) {
-                    break :blk std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch continue;
-                }
-                continue;
-            };
-            const chat_type_val = chat_obj.object.get("type");
-            const is_group = if (chat_type_val) |tv|
-                (if (tv == .string) (!std.mem.eql(u8, tv.string, "private")) else false)
-            else
-                false;
-
-            // Check allowlist against all known identities
-            var ids_buf: [2][]const u8 = undefined;
-            var ids_len: usize = 0;
-            ids_buf[ids_len] = username;
-            ids_len += 1;
-            if (user_id) |uid| {
-                ids_buf[ids_len] = uid;
-                ids_len += 1;
-            }
-
-            const is_authorized = if (is_group) blk: {
-                if (std.mem.eql(u8, self.group_policy, "open")) break :blk true;
-                if (std.mem.eql(u8, self.group_policy, "disabled")) break :blk false;
-
-                // Allowlist context: check group_allow_from for sender, fall back to allow_from
-                if (self.group_allow_from.len > 0) {
-                    break :blk self.isAnyGroupIdentityAllowed(ids_buf[0..ids_len]);
+                    self.pending_media_messages.append(allocator, msg) catch {
+                        allocator.free(msg.id);
+                        allocator.free(msg.sender);
+                        allocator.free(msg.content);
+                        if (msg.first_name) |fn_| allocator.free(fn_);
+                        if (mgid_opt) |m| allocator.free(m);
+                        continue;
+                    };
+                    self.pending_media_group_ids.append(allocator, mgid_opt) catch {
+                        // Rollback to keep pending arrays synchronized
+                        const popped = self.pending_media_messages.pop().?;
+                        allocator.free(popped.id);
+                        allocator.free(popped.sender);
+                        allocator.free(popped.content);
+                        if (popped.first_name) |fn_| allocator.free(fn_);
+                        if (mgid_opt) |m| allocator.free(m);
+                        continue;
+                    };
+                    added_to_pending = true;
+                    // Don't increment i — the remove shifted elements down
                 } else {
-                    break :blk self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+                    i += 1;
                 }
-            } else self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
-
-            if (!is_authorized) {
-                log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
-                    username,
-                    user_id orelse "unknown",
-                });
-                continue;
             }
 
-            // Use username as sender identity, fall back to numeric id
-            const sender_identity = if (!std.mem.eql(u8, username, "unknown"))
-                username
-            else
-                (user_id orelse "unknown");
+            if (added_to_pending) {
+                // Set/extend deadline: flush after 3 seconds of no new group items
+                self.media_group_deadline = root.nowEpochSecs() + 3;
+            }
+        }
 
-            // Extract first_name
-            const first_name_val = from_obj.object.get("first_name");
-            const first_name: ?[]const u8 = if (first_name_val) |fnv| (if (fnv == .string) fnv.string else null) else null;
+        // toOwnedSlice MUST run before manual deinit to avoid double-free via errdefer
+        const final_messages = try messages.toOwnedSlice(allocator);
 
-            // Extract message_id
-            const msg_id_val = message.object.get("message_id");
-            const msg_id: ?i64 = if (msg_id_val) |mv| (if (mv == .integer) mv.integer else null) else null;
+        // Free remaining media_group_id tracking strings (all should be null at this point)
+        for (media_group_ids.items) |mg| {
+            if (mg) |s| allocator.free(s);
+        }
+        media_group_ids.deinit(allocator);
 
-            // Check for voice/audio messages and attempt transcription
-            const content = blk_content: {
-                const voice_obj = message.object.get("voice") orelse message.object.get("audio");
-                if (voice_obj) |vobj| {
-                    if (vobj != .object) break :blk_content null;
-                    const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
-                    const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
+        return final_messages;
+    }
 
-                    if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber)) |transcribed| {
-                        // Prepend [Voice]: prefix
-                        var result: std.ArrayListUnmanaged(u8) = .empty;
-                        result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
-                        result.appendSlice(allocator, transcribed) catch {
-                            result.deinit(allocator);
-                            break :blk_content null;
-                        };
-                        allocator.free(transcribed);
-                        break :blk_content result.toOwnedSlice(allocator) catch null;
-                    }
-                    break :blk_content null;
+    /// Process a single Telegram update: extract message content (voice, photo,
+    /// document, or text), check authorization, and append to the messages list.
+    /// Called from both the main poll loop and the follow-up media group re-poll.
+    fn processUpdate(
+        self: *TelegramChannel,
+        allocator: std.mem.Allocator,
+        update: std.json.Value,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
+    ) void {
+        if (update != .object) return;
+        // Advance offset
+        if (update.object.get("update_id")) |uid| {
+            if (uid == .integer) {
+                self.last_update_id = uid.integer + 1;
+            }
+        }
+
+        const message = update.object.get("message") orelse return;
+        if (message != .object) return;
+
+        // Get sender info — check both @username and numeric user_id
+        const from_obj = message.object.get("from") orelse return;
+        if (from_obj != .object) return;
+        const username_val = from_obj.object.get("username");
+        const username = if (username_val) |uv| (if (uv == .string) uv.string else "unknown") else "unknown";
+
+        var user_id_buf: [32]u8 = undefined;
+        const user_id: ?[]const u8 = blk_uid: {
+            const id_val = from_obj.object.get("id") orelse break :blk_uid null;
+            if (id_val != .integer) break :blk_uid null;
+            break :blk_uid std.fmt.bufPrint(&user_id_buf, "{d}", .{id_val.integer}) catch null;
+        };
+
+        // Get chat_id and chat type
+        const chat_obj = message.object.get("chat") orelse return;
+        if (chat_obj != .object) return;
+        const chat_id_val = chat_obj.object.get("id") orelse return;
+        var chat_id_buf: [32]u8 = undefined;
+        const chat_id_str = if (chat_id_val == .integer)
+            (std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch return)
+        else
+            return;
+        const chat_type_val = chat_obj.object.get("type");
+        const is_group = if (chat_type_val) |tv|
+            (if (tv == .string) (!std.mem.eql(u8, tv.string, "private")) else false)
+        else
+            false;
+
+        // Check allowlist against all known identities
+        var ids_buf: [2][]const u8 = undefined;
+        var ids_len: usize = 0;
+        ids_buf[ids_len] = username;
+        ids_len += 1;
+        if (user_id) |uid| {
+            ids_buf[ids_len] = uid;
+            ids_len += 1;
+        }
+
+        const is_authorized = if (is_group) blk: {
+            if (std.mem.eql(u8, self.group_policy, "open")) break :blk true;
+            if (std.mem.eql(u8, self.group_policy, "disabled")) break :blk false;
+
+            if (self.group_allow_from.len > 0) {
+                break :blk self.isAnyGroupIdentityAllowed(ids_buf[0..ids_len]);
+            } else {
+                break :blk self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+            }
+        } else self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+
+        if (!is_authorized) {
+            log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
+                username,
+                user_id orelse "unknown",
+            });
+            return;
+        }
+
+        const sender_identity = if (!std.mem.eql(u8, username, "unknown"))
+            username
+        else
+            (user_id orelse "unknown");
+
+        const first_name_val = from_obj.object.get("first_name");
+        const first_name: ?[]const u8 = if (first_name_val) |fnv| (if (fnv == .string) fnv.string else null) else null;
+
+        const msg_id_val = message.object.get("message_id");
+        const msg_id: ?i64 = if (msg_id_val) |mv| (if (mv == .integer) mv.integer else null) else null;
+
+        // Check for voice/audio messages and attempt transcription
+        const content = blk_content: {
+            const voice_obj = message.object.get("voice") orelse message.object.get("audio");
+            if (voice_obj) |vobj| {
+                if (vobj != .object) break :blk_content null;
+                const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
+                const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
+
+                if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber)) |transcribed| {
+                    defer allocator.free(transcribed);
+                    var result: std.ArrayListUnmanaged(u8) = .empty;
+                    result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
+                    result.appendSlice(allocator, transcribed) catch {
+                        result.deinit(allocator);
+                        break :blk_content null;
+                    };
+                    break :blk_content result.toOwnedSlice(allocator) catch {
+                        result.deinit(allocator);
+                        break :blk_content null;
+                    };
                 }
+                break :blk_content null;
+            }
 
-                // Check for photo messages — download and wrap as [IMAGE:] marker
-                if (message.object.get("photo")) |photo_val| {
-                    if (photo_val == .array and photo_val.array.items.len > 0) {
-                        // Pick last element (highest resolution)
-                        const last_photo = photo_val.array.items[photo_val.array.items.len - 1];
-                        if (last_photo == .object) {
-                            const fid_val = last_photo.object.get("file_id") orelse break :blk_content null;
-                            const fid = if (fid_val == .string) fid_val.string else break :blk_content null;
-                            if (downloadTelegramPhoto(allocator, self.bot_token, fid, self.proxy)) |local_path| {
-                                var result: std.ArrayListUnmanaged(u8) = .empty;
-                                result.appendSlice(allocator, "[IMAGE:") catch {
-                                    allocator.free(local_path);
-                                    break :blk_content null;
-                                };
-                                result.appendSlice(allocator, local_path) catch {
-                                    allocator.free(local_path);
-                                    result.deinit(allocator);
-                                    break :blk_content null;
-                                };
-                                result.appendSlice(allocator, "]") catch {
-                                    allocator.free(local_path);
-                                    result.deinit(allocator);
-                                    break :blk_content null;
-                                };
+            // Check for photo messages
+            if (message.object.get("photo")) |photo_val| {
+                if (photo_val == .array and photo_val.array.items.len > 0) {
+                    const last_photo = photo_val.array.items[photo_val.array.items.len - 1];
+                    if (last_photo == .object) {
+                        const photo_fid_val = last_photo.object.get("file_id") orelse break :blk_content null;
+                        const photo_fid = if (photo_fid_val == .string) photo_fid_val.string else break :blk_content null;
+
+                        if (downloadTelegramPhoto(allocator, self.bot_token, photo_fid, self.proxy)) |local_path| {
+                            var result: std.ArrayListUnmanaged(u8) = .empty;
+                            result.appendSlice(allocator, "[IMAGE:") catch {
                                 allocator.free(local_path);
-                                // Append caption if present
-                                if (message.object.get("caption")) |cap_val| {
-                                    if (cap_val == .string) {
-                                        result.appendSlice(allocator, " ") catch {};
-                                        result.appendSlice(allocator, cap_val.string) catch {};
-                                    }
+                                break :blk_content null;
+                            };
+                            result.appendSlice(allocator, local_path) catch {
+                                allocator.free(local_path);
+                                result.deinit(allocator);
+                                break :blk_content null;
+                            };
+                            result.appendSlice(allocator, "]") catch {
+                                allocator.free(local_path);
+                                result.deinit(allocator);
+                                break :blk_content null;
+                            };
+                            allocator.free(local_path);
+                            if (message.object.get("caption")) |cap_val| {
+                                if (cap_val == .string) {
+                                    result.appendSlice(allocator, " ") catch {};
+                                    result.appendSlice(allocator, cap_val.string) catch {};
                                 }
-                                break :blk_content result.toOwnedSlice(allocator) catch null;
                             }
+                            break :blk_content result.toOwnedSlice(allocator) catch {
+                                result.deinit(allocator);
+                                break :blk_content null;
+                            };
                         }
                     }
                 }
+            }
 
-                break :blk_content null;
-            };
+            // Check for document messages
+            if (message.object.get("document")) |doc_val| {
+                if (doc_val == .object) {
+                    const doc_fid_val = doc_val.object.get("file_id") orelse break :blk_content null;
+                    const doc_fid = if (doc_fid_val == .string) doc_fid_val.string else break :blk_content null;
+                    const doc_fname: ?[]const u8 = if (doc_val.object.get("file_name")) |fn_val|
+                        (if (fn_val == .string) fn_val.string else null)
+                    else
+                        null;
 
-            // Fall back to text content if no voice/photo content
-            const final_content = content orelse blk_text: {
-                const text_val = message.object.get("text") orelse continue;
-                const text_str = if (text_val == .string) text_val.string else continue;
-                break :blk_text try allocator.dupe(u8, text_str);
-            };
+                    if (downloadTelegramFile(allocator, self.bot_token, doc_fid, doc_fname, self.proxy)) |local_path| {
+                        var result: std.ArrayListUnmanaged(u8) = .empty;
+                        result.appendSlice(allocator, "[FILE:") catch {
+                            allocator.free(local_path);
+                            break :blk_content null;
+                        };
+                        result.appendSlice(allocator, local_path) catch {
+                            allocator.free(local_path);
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
+                        result.appendSlice(allocator, "]") catch {
+                            allocator.free(local_path);
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
+                        allocator.free(local_path);
+                        if (message.object.get("caption")) |cap_val| {
+                            if (cap_val == .string) {
+                                result.appendSlice(allocator, " ") catch {};
+                                result.appendSlice(allocator, cap_val.string) catch {};
+                            }
+                        }
+                        break :blk_content result.toOwnedSlice(allocator) catch {
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
+                    }
+                }
+            }
 
-            try messages.append(allocator, .{
-                .id = try allocator.dupe(u8, sender_identity),
-                .sender = try allocator.dupe(u8, chat_id_str),
-                .content = final_content,
-                .channel = "telegram",
-                .timestamp = root.nowEpochSecs(),
-                .message_id = msg_id,
-                .first_name = if (first_name) |fn_| try allocator.dupe(u8, fn_) else null,
-                .is_group = is_group,
-            });
-        }
+            break :blk_content null;
+        };
 
-        return messages.toOwnedSlice(allocator);
+        // Fall back to text content if no voice/photo/document content
+        const final_content = content orelse blk_text: {
+            const text_val = message.object.get("text") orelse return;
+            const text_str = if (text_val == .string) text_val.string else return;
+            break :blk_text allocator.dupe(u8, text_str) catch return;
+        };
+
+        // Extract media_group_id
+        const media_group_id: ?[]const u8 = blk_mg: {
+            const mg_val = message.object.get("media_group_id") orelse break :blk_mg null;
+            break :blk_mg if (mg_val == .string) mg_val.string else null;
+        };
+
+        const id_dup = allocator.dupe(u8, sender_identity) catch {
+            allocator.free(final_content);
+            return;
+        };
+        const sender_dup = allocator.dupe(u8, chat_id_str) catch {
+            allocator.free(final_content);
+            allocator.free(id_dup);
+            return;
+        };
+        const fn_dup: ?[]const u8 = if (first_name) |fn_|
+            (allocator.dupe(u8, fn_) catch {
+                allocator.free(final_content);
+                allocator.free(id_dup);
+                allocator.free(sender_dup);
+                return;
+            })
+        else
+            null;
+
+        messages.append(allocator, .{
+            .id = id_dup,
+            .sender = sender_dup,
+            .content = final_content,
+            .channel = "telegram",
+            .timestamp = root.nowEpochSecs(),
+            .message_id = msg_id,
+            .first_name = fn_dup,
+            .is_group = is_group,
+        }) catch {
+            allocator.free(final_content);
+            allocator.free(id_dup);
+            allocator.free(sender_dup);
+            if (fn_dup) |f| allocator.free(f);
+            return;
+        };
+
+        // Track media_group_id for merging
+        const mg_dup: ?[]const u8 = if (media_group_id) |mgid|
+            (allocator.dupe(u8, mgid) catch null)
+        else
+            null;
+        media_group_ids.append(allocator, mg_dup) catch {
+            // Rollback to keep messages and media_group_ids synchronized
+            const popped = messages.pop().?;
+            allocator.free(popped.id);
+            allocator.free(popped.sender);
+            allocator.free(popped.content);
+            if (popped.first_name) |f| allocator.free(f);
+            if (mg_dup) |m| allocator.free(m);
+            return;
+        };
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -875,8 +1094,20 @@ pub const TelegramChannel = struct {
     }
 
     fn vtableStop(ptr: *anyopaque) void {
-        _ = ptr;
-        // Nothing to clean up for HTTP polling
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        // Clean up buffered media group messages to prevent shutdown leaks
+        for (self.pending_media_messages.items) |msg| {
+            self.allocator.free(msg.id);
+            self.allocator.free(msg.sender);
+            self.allocator.free(msg.content);
+            if (msg.first_name) |fn_| self.allocator.free(fn_);
+        }
+        self.pending_media_messages.deinit(self.allocator);
+
+        for (self.pending_media_group_ids.items) |mg| {
+            if (mg) |s| self.allocator.free(s);
+        }
+        self.pending_media_group_ids.deinit(self.allocator);
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -1152,9 +1383,93 @@ pub const TypingIndicator = struct {
 // Telegram Photo Download
 // ════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+// Media Group Merging
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Merge messages that belong to the same `media_group_id` into a single message.
+/// Handles interleaved groups (scans the full array, not just consecutive items)
+/// and removes merged entries backward to avoid index-shifting bugs.
+/// Memory-safe: only frees old content after new allocation succeeds.
+fn mergeMediaGroups(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+    media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
+) void {
+    if (messages.items.len <= 1) return;
+
+    var i: usize = 0;
+    while (i < messages.items.len) {
+        const mg = media_group_ids.items[i] orelse {
+            i += 1;
+            continue;
+        };
+
+        // 1. Find all matching indices (supports interleaved messages)
+        var match_indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer match_indices.deinit(allocator);
+
+        var j = i + 1;
+        while (j < messages.items.len) : (j += 1) {
+            if (media_group_ids.items[j]) |other_mg| {
+                if (std.mem.eql(u8, mg, other_mg)) {
+                    match_indices.append(allocator, j) catch {};
+                }
+            }
+        }
+
+        if (match_indices.items.len > 0) {
+            // 2. Build merged content
+            var merged: std.ArrayListUnmanaged(u8) = .empty;
+            var merge_ok = true;
+            merged.appendSlice(allocator, messages.items[i].content) catch {
+                merge_ok = false;
+            };
+
+            if (merge_ok) {
+                for (match_indices.items) |idx| {
+                    merged.appendSlice(allocator, "\n") catch {
+                        merge_ok = false;
+                        break;
+                    };
+                    merged.appendSlice(allocator, messages.items[idx].content) catch {
+                        merge_ok = false;
+                        break;
+                    };
+                }
+            }
+
+            const new_content = if (merge_ok) (merged.toOwnedSlice(allocator) catch null) else null;
+
+            if (new_content) |nc| {
+                // 3. Safely replace root content NOW that allocation succeeded
+                allocator.free(messages.items[i].content);
+                messages.items[i].content = nc;
+
+                // 4. Remove backwards to prevent index shifting
+                var k: usize = match_indices.items.len;
+                while (k > 0) {
+                    k -= 1;
+                    const idx = match_indices.items[k];
+
+                    const extra = messages.orderedRemove(idx);
+                    allocator.free(extra.content);
+                    allocator.free(extra.id);
+                    allocator.free(extra.sender);
+                    if (extra.first_name) |fn_| allocator.free(fn_);
+
+                    if (media_group_ids.items[idx]) |s| allocator.free(s);
+                    _ = media_group_ids.orderedRemove(idx);
+                }
+            } else {
+                merged.deinit(allocator);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Download a photo from Telegram by file_id. Returns the local temp file path (caller-owned).
-/// Calls getFile API, then downloads the binary, saves to temp dir.
-/// Uses the provided proxy settings for all HTTP requests.
 fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, proxy: ?[]const u8) ?[]u8 {
     // 1. Call getFile to get file_path
     var url_buf: [512]u8 = undefined;
@@ -1228,6 +1543,107 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     // Write file
     const file = std.fs.createFileAbsolute(local_path, .{}) catch |err| {
         log.warn("downloadTelegramPhoto: file create failed: {}", .{err});
+        return null;
+    };
+    defer file.close();
+    file.writeAll(data) catch return null;
+
+    return allocator.dupe(u8, local_path) catch null;
+}
+
+/// Download any file from Telegram by file_id. Preserves the original filename when provided.
+/// Returns the local temp file path (caller-owned).
+fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, file_name: ?[]const u8, proxy: ?[]const u8) ?[]u8 {
+    // 1. Call getFile to get file_path
+    var url_buf: [512]u8 = undefined;
+    var url_fbs = std.io.fixedBufferStream(&url_buf);
+    url_fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token}) catch return null;
+    const api_url = url_fbs.getWritten();
+
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_list.deinit(allocator);
+    body_list.appendSlice(allocator, "{\"file_id\":") catch return null;
+    root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
+    body_list.appendSlice(allocator, "}") catch return null;
+
+    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, null) catch |err| {
+        log.warn("downloadTelegramFile: getFile API failed: {}", .{err});
+        return null;
+    };
+    defer allocator.free(resp);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch |err| {
+        log.warn("downloadTelegramFile: JSON parse failed: {}", .{err});
+        return null;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const result_obj = parsed.value.object.get("result") orelse {
+        log.warn("downloadTelegramFile: no 'result' in response", .{});
+        return null;
+    };
+    if (result_obj != .object) return null;
+    const fp_val = result_obj.object.get("file_path") orelse {
+        log.warn("downloadTelegramFile: no 'file_path' in result", .{});
+        return null;
+    };
+    const tg_file_path = if (fp_val == .string) fp_val.string else return null;
+
+    // 2. Download the file
+    var dl_url_buf: [1024]u8 = undefined;
+    var dl_fbs = std.io.fixedBufferStream(&dl_url_buf);
+    dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
+    const dl_url = dl_fbs.getWritten();
+
+    const data = root.http_util.curlGetWithProxy(allocator, dl_url, &.{}, "60", proxy) catch |err| {
+        log.warn("downloadTelegramFile: file download failed: {}", .{err});
+        return null;
+    };
+    defer allocator.free(data);
+
+    // 3. Determine filename: prefer original file_name, fall back to file_id + extension
+    const tmp_dir = platform.getTempDir(allocator) catch return null;
+    defer allocator.free(tmp_dir);
+    var path_buf: [512]u8 = undefined;
+    var path_fbs = std.io.fixedBufferStream(&path_buf);
+
+    if (file_name) |fname| {
+        // Sanitize filename for filesystem safety; incorporate file_id for uniqueness
+        var name_buf: [256]u8 = undefined;
+        const safe_len = @min(fname.len, 180);
+        @memcpy(name_buf[0..safe_len], fname[0..safe_len]);
+        for (name_buf[0..safe_len]) |*c| {
+            if (c.* == '/' or c.* == '\\') c.* = '_';
+        }
+        // Use first 12 chars of file_id as prefix to prevent collisions
+        // Sanitize: file_id is Base64-like and may contain / or \
+        var safe_id: [12]u8 = undefined;
+        const id_prefix_len = @min(file_id.len, 12);
+        @memcpy(safe_id[0..id_prefix_len], file_id[0..id_prefix_len]);
+        for (safe_id[0..id_prefix_len]) |*c| {
+            if (c.* == '/' or c.* == '\\') c.* = '_';
+        }
+        path_fbs.writer().print("{s}/nullclaw_doc_{s}_{s}", .{ tmp_dir, safe_id[0..id_prefix_len], name_buf[0..safe_len] }) catch return null;
+    } else {
+        // Fall back to file_id with extension from tg_file_path
+        const ext = if (std.mem.lastIndexOfScalar(u8, tg_file_path, '.')) |dot|
+            tg_file_path[dot..]
+        else
+            "";
+        var name_buf: [256]u8 = undefined;
+        const safe_len = @min(file_id.len, 200);
+        @memcpy(name_buf[0..safe_len], file_id[0..safe_len]);
+        for (name_buf[0..safe_len]) |*c| {
+            if (c.* == '/' or c.* == '\\') c.* = '_';
+        }
+        path_fbs.writer().print("{s}/nullclaw_doc_{s}{s}", .{ tmp_dir, name_buf[0..safe_len], ext }) catch return null;
+    }
+    const local_path = path_fbs.getWritten();
+
+    // Write file
+    const file = std.fs.createFileAbsolute(local_path, .{}) catch |err| {
+        log.warn("downloadTelegramFile: file create failed: {}", .{err});
         return null;
     };
     defer file.close();
@@ -1770,4 +2186,247 @@ test "telegram sendMediaMultipart data URI treated as local file" {
     const data_uri = "data:image/png;base64,iVBOR";
     try std.testing.expect(!(std.mem.startsWith(u8, data_uri, "http://") or
         std.mem.startsWith(u8, data_uri, "https://")));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Document Handling Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "telegram parseAttachmentMarkers FILE with caption" {
+    const parsed = try parseAttachmentMarkers(
+        std.testing.allocator,
+        "[FILE:/tmp/nullclaw_doc_report.docx] Вот документ",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
+    try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[0].kind);
+    try std.testing.expectEqualStrings("/tmp/nullclaw_doc_report.docx", parsed.attachments[0].target);
+}
+
+test "telegram parseAttachmentMarkers multiple FILE markers" {
+    const parsed = try parseAttachmentMarkers(
+        std.testing.allocator,
+        "[FILE:/tmp/a.docx]\n[FILE:/tmp/b.csv]",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.attachments.len);
+    try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[0].kind);
+    try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[1].kind);
+    try std.testing.expectEqualStrings("/tmp/a.docx", parsed.attachments[0].target);
+    try std.testing.expectEqualStrings("/tmp/b.csv", parsed.attachments[1].target);
+}
+
+test "telegram parseAttachmentMarkers mixed FILE and IMAGE" {
+    const parsed = try parseAttachmentMarkers(
+        std.testing.allocator,
+        "[IMAGE:/tmp/photo.jpg]\n[FILE:/tmp/doc.pdf] описание",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.attachments.len);
+    try std.testing.expectEqual(AttachmentKind.image, parsed.attachments[0].kind);
+    try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[1].kind);
+}
+
+test "telegram inferAttachmentKindFromExtension docx is document" {
+    try std.testing.expectEqual(AttachmentKind.document, inferAttachmentKindFromExtension("/tmp/report.docx"));
+}
+
+test "telegram inferAttachmentKindFromExtension csv is document" {
+    try std.testing.expectEqual(AttachmentKind.document, inferAttachmentKindFromExtension("/tmp/data.csv"));
+}
+
+test "telegram inferAttachmentKindFromExtension xlsx is document" {
+    try std.testing.expectEqual(AttachmentKind.document, inferAttachmentKindFromExtension("/tmp/sheet.xlsx"));
+}
+
+test "telegram media group content merging" {
+    // Simulate media group merging: two FILE markers from same group
+    // should be concatenated with newline separator.
+    const alloc = std.testing.allocator;
+    const content1 = try alloc.dupe(u8, "[FILE:/tmp/a.docx]");
+    defer alloc.free(content1);
+    const content2 = try alloc.dupe(u8, "[FILE:/tmp/b.csv] Вот файлы");
+    defer alloc.free(content2);
+
+    // Merged content should contain both markers
+    var merged: std.ArrayListUnmanaged(u8) = .empty;
+    defer merged.deinit(alloc);
+    try merged.appendSlice(alloc, content1);
+    try merged.appendSlice(alloc, "\n");
+    try merged.appendSlice(alloc, content2);
+
+    // Verify merged content parses correctly
+    const parsed = try parseAttachmentMarkers(alloc, merged.items);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.attachments.len);
+    try std.testing.expectEqualStrings("/tmp/a.docx", parsed.attachments[0].target);
+    try std.testing.expectEqualStrings("/tmp/b.csv", parsed.attachments[1].target);
+}
+
+test "telegram media group content merging preserves caption" {
+    const alloc = std.testing.allocator;
+    // Simulate merged media group: images with caption on last one
+    var merged: std.ArrayListUnmanaged(u8) = .empty;
+    defer merged.deinit(alloc);
+    try merged.appendSlice(alloc, "[IMAGE:/tmp/photo1.jpg]\n[IMAGE:/tmp/photo2.jpg] Опиши эти две картинки");
+
+    const parsed = try parseAttachmentMarkers(alloc, merged.items);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.attachments.len);
+    try std.testing.expectEqual(AttachmentKind.image, parsed.attachments[0].kind);
+    try std.testing.expectEqual(AttachmentKind.image, parsed.attachments[1].kind);
+}
+
+test "telegram parseAttachmentMarkers FILE with cyrillic filename" {
+    const parsed = try parseAttachmentMarkers(
+        std.testing.allocator,
+        "[FILE:/tmp/nullclaw_doc_Справка_в_школы.docx]",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
+    try std.testing.expectEqualStrings("/tmp/nullclaw_doc_Справка_в_школы.docx", parsed.attachments[0].target);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// mergeMediaGroups Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "telegram mergeMediaGroups consecutive items" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer messages.deinit(alloc);
+    var mgids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (mgids.items) |mg| if (mg) |s| alloc.free(s);
+        mgids.deinit(alloc);
+    }
+
+    // Add two messages with same media_group_id
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "123"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/a.docx]"),
+        .channel = "telegram",
+        .timestamp = 0,
+    });
+    try mgids.append(alloc, try alloc.dupe(u8, "group_1"));
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "123"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/b.csv] caption"),
+        .channel = "telegram",
+        .timestamp = 0,
+    });
+    try mgids.append(alloc, try alloc.dupe(u8, "group_1"));
+
+    mergeMediaGroups(alloc, &messages, &mgids);
+
+    // Should merge into 1 message
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].content, "[FILE:/tmp/a.docx]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].content, "[FILE:/tmp/b.csv] caption") != null);
+
+    // Clean up remaining message
+    alloc.free(messages.items[0].id);
+    alloc.free(messages.items[0].sender);
+    alloc.free(messages.items[0].content);
+}
+
+test "telegram mergeMediaGroups interleaved items" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer messages.deinit(alloc);
+    var mgids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (mgids.items) |mg| if (mg) |s| alloc.free(s);
+        mgids.deinit(alloc);
+    }
+
+    // msg0: group_A
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "123"),
+        .content = try alloc.dupe(u8, "[IMAGE:/tmp/photo1.jpg]"),
+        .channel = "telegram",
+        .timestamp = 0,
+    });
+    try mgids.append(alloc, try alloc.dupe(u8, "group_A"));
+
+    // msg1: no group (standalone text)
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user2"),
+        .sender = try alloc.dupe(u8, "456"),
+        .content = try alloc.dupe(u8, "Hello!"),
+        .channel = "telegram",
+        .timestamp = 0,
+    });
+    try mgids.append(alloc, null);
+
+    // msg2: group_A (interleaved)
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "123"),
+        .content = try alloc.dupe(u8, "[IMAGE:/tmp/photo2.jpg]"),
+        .channel = "telegram",
+        .timestamp = 0,
+    });
+    try mgids.append(alloc, try alloc.dupe(u8, "group_A"));
+
+    mergeMediaGroups(alloc, &messages, &mgids);
+
+    // Should merge group_A into 1 message, keep standalone text
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+
+    // First message: merged group_A content
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].content, "[IMAGE:/tmp/photo1.jpg]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].content, "[IMAGE:/tmp/photo2.jpg]") != null);
+
+    // Second message: standalone text
+    try std.testing.expectEqualStrings("Hello!", messages.items[1].content);
+
+    // Clean up remaining messages
+    for (messages.items) |msg| {
+        alloc.free(msg.id);
+        alloc.free(msg.sender);
+        alloc.free(msg.content);
+    }
+}
+
+test "telegram mergeMediaGroups single item no merge" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer messages.deinit(alloc);
+    var mgids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (mgids.items) |mg| if (mg) |s| alloc.free(s);
+        mgids.deinit(alloc);
+    }
+
+    // Single message with media_group_id (the group has only one item)
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "123"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/doc.pdf]"),
+        .channel = "telegram",
+        .timestamp = 0,
+    });
+    try mgids.append(alloc, try alloc.dupe(u8, "group_solo"));
+
+    mergeMediaGroups(alloc, &messages, &mgids);
+
+    // Should not merge — still 1 message
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("[FILE:/tmp/doc.pdf]", messages.items[0].content);
+
+    // Clean up
+    alloc.free(messages.items[0].id);
+    alloc.free(messages.items[0].sender);
+    alloc.free(messages.items[0].content);
 }
