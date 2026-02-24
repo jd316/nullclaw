@@ -190,7 +190,7 @@ pub const CronNormalized = struct {
     needs_second_prefix: bool,
 };
 
-const MAX_CRON_LOOKAHEAD_MINUTES: usize = 366 * 24 * 60;
+const MAX_CRON_LOOKAHEAD_MINUTES: usize = 8 * 366 * 24 * 60;
 
 const ParsedCronExpression = struct {
     minutes: [60]bool = .{false} ** 60,
@@ -727,6 +727,102 @@ pub const CronScheduler = struct {
     }
 };
 
+const LoadPolicy = enum {
+    best_effort,
+    strict,
+};
+
+fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
+    const path = try cronJsonPath(scheduler.allocator);
+    defer scheduler.allocator.free(path);
+
+    const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => switch (policy) {
+            .best_effort => return,
+            .strict => return err,
+        },
+    };
+    defer scheduler.allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, scheduler.allocator, content, .{}) catch |err| switch (policy) {
+        .best_effort => return,
+        .strict => return err,
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .array) switch (policy) {
+        .best_effort => return,
+        .strict => return error.InvalidCronStoreFormat,
+    };
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) switch (policy) {
+            .best_effort => continue,
+            .strict => return error.InvalidCronStoreFormat,
+        };
+        const obj = item.object;
+
+        const id = blk: {
+            if (obj.get("id")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const expression = blk: {
+            if (obj.get("expression")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const command = blk: {
+            if (obj.get("command")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+
+        const next_run_secs: i64 = blk: {
+            if (obj.get("next_run_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+            }
+            break :blk std.time.timestamp() + 60;
+        };
+
+        const paused = blk: {
+            if (obj.get("paused")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        const one_shot = blk: {
+            if (obj.get("one_shot")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        try scheduler.jobs.append(scheduler.allocator, .{
+            .id = try scheduler.allocator.dupe(u8, id),
+            .expression = try scheduler.allocator.dupe(u8, expression),
+            .command = try scheduler.allocator.dupe(u8, command),
+            .next_run_secs = next_run_secs,
+            .paused = paused,
+            .one_shot = one_shot,
+        });
+    }
+}
+
 // ── Delivery ─────────────────────────────────────────────────────
 
 /// Deliver a cron job result to a channel via the outbound bus.
@@ -846,76 +942,21 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
 
 /// Load jobs from ~/.nullclaw/cron.json into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
-    const path = try cronJsonPath(scheduler.allocator);
-    defer scheduler.allocator.free(path);
+    try loadJobsWithPolicy(scheduler, .best_effort);
+}
 
-    const content = std.fs.cwd().readFileAlloc(scheduler.allocator, path, 1024 * 1024) catch return;
-    defer scheduler.allocator.free(content);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, scheduler.allocator, content, .{}) catch return;
-    defer parsed.deinit();
-
-    if (parsed.value != .array) return;
-
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const obj = item.object;
-
-        const id = blk: {
-            if (obj.get("id")) |v| {
-                if (v == .string) break :blk v.string;
-            }
-            continue;
-        };
-        const expression = blk: {
-            if (obj.get("expression")) |v| {
-                if (v == .string) break :blk v.string;
-            }
-            continue;
-        };
-        const command = blk: {
-            if (obj.get("command")) |v| {
-                if (v == .string) break :blk v.string;
-            }
-            continue;
-        };
-
-        const next_run_secs: i64 = blk: {
-            if (obj.get("next_run_secs")) |v| {
-                if (v == .integer) break :blk v.integer;
-            }
-            break :blk std.time.timestamp() + 60;
-        };
-
-        const paused = blk: {
-            if (obj.get("paused")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk false;
-        };
-
-        const one_shot = blk: {
-            if (obj.get("one_shot")) |v| {
-                if (v == .bool) break :blk v.bool;
-            }
-            break :blk false;
-        };
-
-        try scheduler.jobs.append(scheduler.allocator, .{
-            .id = try scheduler.allocator.dupe(u8, id),
-            .expression = try scheduler.allocator.dupe(u8, expression),
-            .command = try scheduler.allocator.dupe(u8, command),
-            .next_run_secs = next_run_secs,
-            .paused = paused,
-            .one_shot = one_shot,
-        });
-    }
+/// Load jobs from ~/.nullclaw/cron.json; unlike loadJobs, this returns
+/// parse/read errors (except missing file/path).
+pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
+    try loadJobsWithPolicy(scheduler, .strict);
 }
 
 /// Replace in-memory jobs with the persisted store content.
 pub fn reloadJobs(scheduler: *CronScheduler) !void {
-    scheduler.clearJobs();
-    try loadJobs(scheduler);
+    var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+    std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
 }
 
 // ── CLI entry points (called from main.zig) ──────────────────────
@@ -1164,6 +1205,10 @@ test "nextRunForCronExpression supports sunday aliases 0 and 7" {
     try std.testing.expectEqual(next_sun_zero, next_sun_seven);
 }
 
+test "nextRunForCronExpression handles leap-day schedules beyond one year" {
+    try std.testing.expectEqual(@as(i64, 68169600), try nextRunForCronExpression("0 0 29 2 *", 0));
+}
+
 test "CronScheduler add and list" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
@@ -1244,6 +1289,34 @@ test "save and load roundtrip" {
     try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
     try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "reloadJobs keeps existing jobs when store becomes invalid" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("*/10 * * * *", "echo keep");
+    try saveJobs(&scheduler);
+
+    var runtime = CronScheduler.init(std.testing.allocator, 10, true);
+    defer runtime.deinit();
+    try loadJobs(&runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
+
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const bad_file = try std.fs.createFileAbsolute(path, .{});
+    defer bad_file.close();
+    try bad_file.writeAll("{bad-json");
+
+    var reload_failed = false;
+    reloadJobs(&runtime) catch {
+        reload_failed = true;
+    };
+    try std.testing.expect(reload_failed);
+    try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
+
+    // Restore valid store for subsequent tests.
+    try saveJobs(&runtime);
 }
 
 test "JobType parse and asStr" {
