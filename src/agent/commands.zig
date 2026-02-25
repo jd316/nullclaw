@@ -44,6 +44,16 @@ fn firstToken(arg: []const u8) []const u8 {
     return it.next() orelse "";
 }
 
+fn parsePositiveUsize(raw: []const u8) ?usize {
+    const n = std.fmt.parseInt(usize, raw, 10) catch return null;
+    if (n == 0) return null;
+    return n;
+}
+
+fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
+    return if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
+}
+
 fn setModelName(self: anytype, model: []const u8) !void {
     if (self.model_name_owned) self.allocator.free(self.model_name);
     self.model_name = try self.allocator.dupe(u8, model);
@@ -1523,7 +1533,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /dock-telegram, /dock-discord, /dock-slack
             \\  /activation, /send, /elevated, /bash, /poll, /skill
             \\  /doctor — memory subsystem diagnostics
-            \\  /memory <reindex|doctor|stats>
+            \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
             \\  exit, quit
         );
     }
@@ -1596,32 +1606,171 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
 }
 
 fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
-    const sub = firstToken(arg);
+    const usage =
+        "Usage: /memory <stats|status|reindex|count|search|get|list|drain-outbox>\n" ++
+        "  /memory search <query> [--limit N]\n" ++
+        "  /memory get <key>\n" ++
+        "  /memory list [--category C] [--limit N]";
 
-    if (std.mem.eql(u8, sub, "reindex")) {
-        const rt: ?*memory_mod.MemoryRuntime = if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
-        if (rt) |mem_rt| {
-            const count = mem_rt.reindex(self.allocator);
-            return try std.fmt.allocPrint(self.allocator, "Reindex complete: {d} entries reindexed.", .{count});
-        }
-        return try self.allocator.dupe(u8, "Memory runtime not available. Cannot reindex.");
-    }
+    const parsed = splitFirstToken(arg);
+    const sub = parsed.head;
+    const rest = parsed.tail;
+
+    if (sub.len == 0) return try self.allocator.dupe(u8, usage);
 
     if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "status")) {
         return try handleDoctorCommand(self);
     }
 
-    if (std.mem.eql(u8, sub, "stats")) {
-        const rt: ?*memory_mod.MemoryRuntime = if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
-        if (rt) |mem_rt| {
-            const r = mem_rt.resolved;
-            return try std.fmt.allocPrint(self.allocator,
-                "Memory resolved config:\n  backend: {s}\n  retrieval: {s}\n  vector: {s}\n  embedding: {s}\n  rollout: {s}\n  sync: {s}\n  sources: {d}\n  fallback: {s}",
-                .{ r.primary_backend, r.retrieval_mode, r.vector_mode, r.embedding_provider, r.rollout_mode, r.vector_sync_mode, r.source_count, r.fallback_policy },
-            );
-        }
+    const mem_rt = memoryRuntimePtr(self) orelse {
         return try self.allocator.dupe(u8, "Memory runtime not available.");
+    };
+
+    if (std.mem.eql(u8, sub, "stats")) {
+        const r = mem_rt.resolved;
+        const report = mem_rt.diagnose();
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Memory resolved config:\n", .{});
+        try w.print("  backend: {s}\n", .{r.primary_backend});
+        try w.print("  retrieval: {s}\n", .{r.retrieval_mode});
+        try w.print("  vector: {s}\n", .{r.vector_mode});
+        try w.print("  embedding: {s}\n", .{r.embedding_provider});
+        try w.print("  rollout: {s}\n", .{r.rollout_mode});
+        try w.print("  sync: {s}\n", .{r.vector_sync_mode});
+        try w.print("  sources: {d}\n", .{r.source_count});
+        try w.print("  fallback: {s}\n", .{r.fallback_policy});
+        try w.print("  entries: {d}\n", .{report.entry_count});
+        if (report.vector_entry_count) |n| {
+            try w.print("  vector_entries: {d}\n", .{n});
+        } else {
+            try w.print("  vector_entries: n/a\n", .{});
+        }
+        if (report.outbox_pending) |n| {
+            try w.print("  outbox_pending: {d}\n", .{n});
+        } else {
+            try w.print("  outbox_pending: n/a\n", .{});
+        }
+        return try out.toOwnedSlice(self.allocator);
     }
 
-    return try self.allocator.dupe(u8, "Usage: /memory <reindex|doctor|stats>");
+    if (std.mem.eql(u8, sub, "count")) {
+        const count = mem_rt.memory.count() catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory count failed: {s}", .{@errorName(err)});
+        };
+        return try std.fmt.allocPrint(self.allocator, "{d}", .{count});
+    }
+
+    if (std.mem.eql(u8, sub, "reindex")) {
+        const count = mem_rt.reindex(self.allocator);
+        if (std.mem.eql(u8, mem_rt.resolved.vector_mode, "none")) {
+            return try self.allocator.dupe(u8, "Vector plane is disabled; reindex skipped (0 entries).");
+        }
+        return try std.fmt.allocPrint(self.allocator, "Reindex complete: {d} entries reindexed.", .{count});
+    }
+
+    if (std.mem.eql(u8, sub, "drain-outbox") or std.mem.eql(u8, sub, "drain_outbox")) {
+        const drained = mem_rt.drainOutbox(self.allocator);
+        return try std.fmt.allocPrint(self.allocator, "Outbox drain complete: {d} operation(s) processed.", .{drained});
+    }
+
+    if (std.mem.eql(u8, sub, "get")) {
+        const key = std.mem.trim(u8, rest, " \t");
+        if (key.len == 0) return try self.allocator.dupe(u8, "Usage: /memory get <key>");
+        const entry = mem_rt.memory.get(self.allocator, key) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory get failed: {s}", .{@errorName(err)});
+        };
+        if (entry) |e| {
+            defer e.deinit(self.allocator);
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}",
+                .{ e.key, e.category.toString(), e.timestamp, e.content },
+            );
+        }
+        return try std.fmt.allocPrint(self.allocator, "Not found: {s}", .{key});
+    }
+
+    if (std.mem.eql(u8, sub, "search")) {
+        var limit: usize = 6;
+        var query_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer query_buf.deinit(self.allocator);
+
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--limit")) {
+                const next = it.next() orelse return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
+                limit = parsePositiveUsize(next) orelse return try std.fmt.allocPrint(self.allocator, "Invalid --limit value: {s}", .{next});
+                continue;
+            }
+            if (query_buf.items.len > 0) try query_buf.append(self.allocator, ' ');
+            try query_buf.appendSlice(self.allocator, tok);
+        }
+
+        const query = std.mem.trim(u8, query_buf.items, " \t");
+        if (query.len == 0) return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
+
+        const results = mem_rt.search(self.allocator, query, limit, null) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory search failed: {s}", .{@errorName(err)});
+        };
+        defer memory_mod.retrieval.freeCandidates(self.allocator, results);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Search results: {d}\n", .{results.len});
+        for (results, 0..) |c, idx| {
+            try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
+            if (c.vector_score) |vs| {
+                try w.print(" vector_score={d:.4}", .{vs});
+            } else {
+                try w.print(" vector_score=n/a", .{});
+            }
+            try w.print(" source={s}\n", .{c.source});
+            const preview_len = @min(@as(usize, 140), c.snippet.len);
+            const preview = c.snippet[0..preview_len];
+            try w.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    if (std.mem.eql(u8, sub, "list")) {
+        var limit: usize = 20;
+        var category_opt: ?memory_mod.MemoryCategory = null;
+        var it = std.mem.tokenizeAny(u8, rest, " \t");
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--limit")) {
+                const next = it.next() orelse return try self.allocator.dupe(u8, "Usage: /memory list [--category C] [--limit N]");
+                limit = parsePositiveUsize(next) orelse return try std.fmt.allocPrint(self.allocator, "Invalid --limit value: {s}", .{next});
+                continue;
+            }
+            if (std.mem.eql(u8, tok, "--category")) {
+                const next = it.next() orelse return try self.allocator.dupe(u8, "Usage: /memory list [--category C] [--limit N]");
+                category_opt = memory_mod.MemoryCategory.fromString(next);
+                continue;
+            }
+            return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
+        }
+
+        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
+        };
+        defer memory_mod.freeEntries(self.allocator, entries);
+
+        const shown = @min(limit, entries.len);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+        try w.print("Memory entries: showing {d}/{d}\n", .{ shown, entries.len });
+        for (entries[0..shown], 0..) |e, idx| {
+            const preview_len = @min(@as(usize, 120), e.content.len);
+            const preview = e.content[0..preview_len];
+            try w.print("  {d}. {s} [{s}] {s}\n", .{ idx + 1, e.key, e.category.toString(), e.timestamp });
+            try w.print("     {s}{s}\n", .{ preview, if (e.content.len > preview_len) "..." else "" });
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    return try self.allocator.dupe(u8, usage);
 }
