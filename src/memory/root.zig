@@ -317,7 +317,7 @@ pub const Memory = struct {
 /// Stored in MemoryRuntime for diagnostics, `/doctor`, and runtime inspection.
 pub const ResolvedConfig = struct {
     primary_backend: []const u8,
-    retrieval_mode: []const u8, // "keyword" | "hybrid"
+    retrieval_mode: []const u8, // "disabled" | "keyword" | "hybrid"
     vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "qdrant" | "pgvector"
     embedding_provider: []const u8, // "none" | "openai" | "gemini" | "voyage" | "ollama" | "auto"
     rollout_mode: []const u8,
@@ -343,6 +343,7 @@ pub const MemoryRuntime = struct {
     _cache_db_path: ?[*:0]const u8,
     _engine: ?*retrieval.RetrievalEngine,
     _allocator: std.mem.Allocator,
+    _search_enabled: bool = true,
 
     // P5: rollout policy
     _rollout_policy: rollout.RolloutPolicy = .{ .mode = .on, .canary_percent = 0, .shadow_percent = 0 },
@@ -363,6 +364,8 @@ pub const MemoryRuntime = struct {
 
     /// High-level search: uses rollout policy to decide keyword-only vs hybrid.
     pub fn search(self: *MemoryRuntime, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]RetrievalCandidate {
+        if (!self._search_enabled) return allocator.alloc(RetrievalCandidate, 0);
+
         const decision = self._rollout_policy.decide(session_id);
 
         switch (decision) {
@@ -525,8 +528,7 @@ pub const MemoryRuntime = struct {
 
         // P3 cleanup (outbox borrows db from vector store or primary — deinit before them)
         if (self._outbox) |ob| {
-            ob.deinit();
-            self._allocator.destroy(ob);
+            ob.deinit(); // handles owns_self destroy
         }
         if (self._circuit_breaker) |cb| {
             self._allocator.destroy(cb);
@@ -631,7 +633,7 @@ pub fn initRuntime(
 
     // ── Retrieval engine ──
     var engine: ?*retrieval.RetrievalEngine = null;
-    build_engine: {
+    if (config.search.enabled) build_engine: {
         const eng = allocator.create(retrieval.RetrievalEngine) catch break :build_engine;
         eng.* = retrieval.RetrievalEngine.init(allocator, config.search.query);
 
@@ -674,7 +676,7 @@ pub fn initRuntime(
     var outbox_inst: ?*outbox.VectorOutbox = null;
     var sidecar_db_path: ?[*:0]const u8 = null;
     var resolved_vector_mode: []const u8 = "none";
-    if (!std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
+    if (config.search.enabled and !std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
         // 1. Create EmbeddingProvider (with optional fallback via ProviderRouter)
         const primary_ep = embeddings.createEmbeddingProvider(
             allocator,
@@ -782,7 +784,16 @@ pub fn initRuntime(
 
             // sqlite_sidecar: explicit or auto fallback for non-sqlite backends
             if (vs_iface == null) {
-                const sidecar_path_slice = std.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
+                const sidecar_path_slice = blk: {
+                    const configured = config.search.store.sidecar_path;
+                    if (configured.len == 0) {
+                        break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
+                    }
+                    if (std.fs.path.isAbsolute(configured)) {
+                        break :blk allocator.dupeZ(u8, configured) catch break :vec_plane;
+                    }
+                    break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, configured }) catch break :vec_plane;
+                };
                 const sidecar_path: [*:0]const u8 = sidecar_path_slice.ptr;
                 const vs = allocator.create(vector_store.SqliteSidecarVectorStore) catch {
                     allocator.free(sidecar_path_slice);
@@ -813,7 +824,8 @@ pub fn initRuntime(
         if (!std.mem.eql(u8, config.search.sync.mode, "best_effort")) {
             if (db_handle_for_outbox) |db_h| {
                 const ob = allocator.create(outbox.VectorOutbox) catch break :vec_plane;
-                ob.* = outbox.VectorOutbox.init(allocator, db_h, config.search.sync.embed_max_retries);
+                const outbox_retries = @max(config.search.sync.embed_max_retries, config.search.sync.vector_max_retries);
+                ob.* = outbox.VectorOutbox.init(allocator, db_h, outbox_retries);
                 ob.owns_self = true;
                 ob.migrate() catch {
                     allocator.destroy(ob);
@@ -831,7 +843,7 @@ pub fn initRuntime(
 
     // Enforce fallback_policy: if fail_fast and vector plane was expected but failed, abort.
     if (std.mem.eql(u8, config.reliability.fallback_policy, "fail_fast")) {
-        if (!std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled and vs_iface == null) {
+        if (config.search.enabled and !std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled and vs_iface == null) {
             log.warn("fallback_policy=fail_fast: vector plane init failed, aborting runtime creation", .{});
             // Clean up partially-created P3 resources
             if (embed_provider) |ep| ep.deinit();
@@ -890,11 +902,17 @@ pub fn initRuntime(
     };
 
     // ── Startup diagnostic ──
+    const retrieval_mode: []const u8 = if (!config.search.enabled)
+        "disabled"
+    else if (config.search.query.hybrid.enabled)
+        "hybrid"
+    else
+        "keyword";
     const source_count: usize = if (engine) |eng| eng.sources.items.len else 0;
     const vector_mode: []const u8 = if (vs_iface == null) "none" else resolved_vector_mode;
     log.info("memory plan resolved: backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
         config.backend,
-        if (config.search.query.hybrid.enabled) "hybrid" else "keyword",
+        retrieval_mode,
         vector_mode,
         config.reliability.rollout_mode,
         config.lifecycle.hygiene_enabled,
@@ -914,7 +932,7 @@ pub fn initRuntime(
         .capabilities = desc.capabilities,
         .resolved = .{
             .primary_backend = config.backend,
-            .retrieval_mode = if (config.search.query.hybrid.enabled) "hybrid" else "keyword",
+            .retrieval_mode = retrieval_mode,
             .vector_mode = vector_mode,
             .embedding_provider = embed_name,
             .rollout_mode = config.reliability.rollout_mode,
@@ -931,6 +949,7 @@ pub fn initRuntime(
         ._cache_db_path = cache_db_path,
         ._engine = engine,
         ._allocator = allocator,
+        ._search_enabled = config.search.enabled,
         ._rollout_policy = rollout.RolloutPolicy.init(config.reliability),
         ._summarizer_cfg = summarizer_cfg,
         ._semantic_cache = sem_cache,
@@ -1284,6 +1303,82 @@ test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
 
     try std.testing.expect(rt._vector_store != null);
     try std.testing.expectEqualStrings("sqlite_sidecar", rt.resolved.vector_mode);
+}
+
+test "initRuntime uses configured relative sqlite_sidecar path" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .store = .{
+                .kind = "sqlite_sidecar",
+                .sidecar_path = "vectors-custom.db",
+            },
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._sidecar_db_path != null);
+    try std.testing.expectEqualStrings("/tmp/vectors-custom.db", std.mem.span(rt._sidecar_db_path.?));
+}
+
+test "initRuntime uses configured absolute sqlite_sidecar path" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .store = .{
+                .kind = "sqlite_sidecar",
+                .sidecar_path = "/tmp/vectors-absolute.db",
+            },
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._sidecar_db_path != null);
+    try std.testing.expectEqualStrings("/tmp/vectors-absolute.db", std.mem.span(rt._sidecar_db_path.?));
+}
+
+test "initRuntime respects search.enabled=false" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .enabled = false,
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._engine == null);
+    try std.testing.expect(rt._embedding_provider == null);
+    try std.testing.expect(rt._vector_store == null);
+    try std.testing.expectEqualStrings("disabled", rt.resolved.retrieval_mode);
+
+    const candidates = try rt.search(std.testing.allocator, "query", 5, null);
+    defer retrieval.freeCandidates(std.testing.allocator, candidates);
+    try std.testing.expectEqual(@as(usize, 0), candidates.len);
+}
+
+test "initRuntime durable_outbox uses max of embed/vector retry config" {
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .sync = .{
+                .mode = "durable_outbox",
+                .embed_max_retries = 1,
+                .vector_max_retries = 5,
+            },
+        },
+    }, "/tmp") orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    const ob = rt._outbox orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 5), ob.max_retries);
 }
 
 test "MemoryRuntime.syncVectorAfterStore with no provider is no-op" {

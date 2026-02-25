@@ -11,6 +11,7 @@ const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
 const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
 const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
+const net_security = @import("../../net_security.zig");
 
 // ── Embedding provider vtable ─────────────────────────────────────
 
@@ -98,6 +99,8 @@ pub const OpenAiEmbedding = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, base_url: []const u8, api_key: []const u8, model: []const u8, dims: u32) !*Self {
+        try validateEmbeddingBaseUrl(base_url);
+
         const self_ = try allocator.create(Self);
         errdefer allocator.destroy(self_);
 
@@ -234,6 +237,21 @@ fn hasExplicitApiPath(url: []const u8) bool {
     // Trim trailing slashes
     const trimmed = std.mem.trimRight(u8, path, "/");
     return trimmed.len > 0 and !std.mem.eql(u8, trimmed, "/");
+}
+
+/// Require a parseable HTTP(S) endpoint. Plain HTTP is only allowed on local hosts.
+fn validateEmbeddingBaseUrl(url: []const u8) !void {
+    if (url.len == 0) return error.InvalidEmbeddingApiUrl;
+    _ = std.Uri.parse(url) catch return error.InvalidEmbeddingApiUrl;
+
+    const is_https = std.mem.startsWith(u8, url, "https://");
+    const is_http = std.mem.startsWith(u8, url, "http://");
+    if (!is_https and !is_http) return error.InvalidEmbeddingApiUrl;
+
+    if (is_http) {
+        const host = net_security.extractHost(url) orelse return error.InvalidEmbeddingApiUrl;
+        if (!net_security.isLocalHost(host)) return error.InsecureEmbeddingApiUrl;
+    }
 }
 
 /// Parse an OpenAI-compatible embeddings API response to extract the embedding vector.
@@ -563,6 +581,29 @@ test "OpenAiEmbedding init and deinit" {
     p.deinit();
 }
 
+test "OpenAiEmbedding init rejects insecure remote http url" {
+    const result = OpenAiEmbedding.init(
+        std.testing.allocator,
+        "http://example.com",
+        "test-key",
+        "text-embedding-3-small",
+        1536,
+    );
+    try std.testing.expectError(error.InsecureEmbeddingApiUrl, result);
+}
+
+test "OpenAiEmbedding init accepts localhost http url" {
+    var impl_ = try OpenAiEmbedding.init(
+        std.testing.allocator,
+        "http://127.0.0.1:11434",
+        "test-key",
+        "text-embedding-3-small",
+        1536,
+    );
+    const p = impl_.provider();
+    p.deinit();
+}
+
 test "OpenAiEmbedding embeddingsUrl standard" {
     var impl_ = try OpenAiEmbedding.init(
         std.testing.allocator,
@@ -670,6 +711,17 @@ test "createEmbeddingProvider ollama with custom model" {
     try std.testing.expectEqualStrings("ollama", p.getName());
     try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
     p.deinit();
+}
+
+test "createEmbeddingProvider custom rejects insecure remote http url" {
+    const provider = createEmbeddingProvider(
+        std.testing.allocator,
+        "custom:http://example.com/v1",
+        "test-key",
+        "text-embedding-3-small",
+        1536,
+    );
+    try std.testing.expectError(error.InsecureEmbeddingApiUrl, provider);
 }
 
 // ── Embedding cache tests ─────────────────────────────────────────

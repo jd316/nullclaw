@@ -389,7 +389,7 @@ test "diagnose with outbox" {
 
     const ob = try allocator.create(outbox_mod.VectorOutbox);
     ob.* = outbox_mod.VectorOutbox.init(allocator, sqlite_impl.db, 2);
-    ob.owns_self = false; // MemoryRuntime.deinit() handles destroy
+    ob.owns_self = true; // deinit() destroys self when owned
     try ob.migrate();
 
     // Enqueue an item

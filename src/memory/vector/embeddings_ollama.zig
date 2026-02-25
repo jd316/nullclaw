@@ -7,6 +7,7 @@
 const std = @import("std");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
+const net_security = @import("../../net_security.zig");
 
 pub const OllamaEmbedding = struct {
     allocator: std.mem.Allocator,
@@ -26,6 +27,8 @@ pub const OllamaEmbedding = struct {
         base_url: ?[]const u8,
         dims: ?u32,
     ) !*Self {
+        try validateBaseUrl(base_url orelse default_base_url);
+
         const self_ = try allocator.create(Self);
         errdefer allocator.destroy(self_);
 
@@ -40,6 +43,21 @@ pub const OllamaEmbedding = struct {
             .dims = dims orelse default_dims,
         };
         return self_;
+    }
+
+    /// Require a parseable HTTP(S) endpoint. Plain HTTP is only allowed on local hosts.
+    fn validateBaseUrl(url: []const u8) !void {
+        if (url.len == 0) return error.InvalidEmbeddingApiUrl;
+        _ = std.Uri.parse(url) catch return error.InvalidEmbeddingApiUrl;
+
+        const is_https = std.mem.startsWith(u8, url, "https://");
+        const is_http = std.mem.startsWith(u8, url, "http://");
+        if (!is_https and !is_http) return error.InvalidEmbeddingApiUrl;
+
+        if (is_http) {
+            const host = net_security.extractHost(url) orelse return error.InvalidEmbeddingApiUrl;
+            if (!net_security.isLocalHost(host)) return error.InsecureEmbeddingApiUrl;
+        }
     }
 
     pub fn deinitSelf(self: *Self) void {
@@ -187,13 +205,23 @@ test "OllamaEmbedding init with custom values" {
     var impl_ = try OllamaEmbedding.init(
         std.testing.allocator,
         "mxbai-embed-large",
-        "http://gpu-server:11434",
+        "https://gpu-server:11434",
         1024,
     );
     const p = impl_.provider();
     try std.testing.expectEqualStrings("ollama", p.getName());
     try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
     p.deinit();
+}
+
+test "OllamaEmbedding init rejects insecure remote http url" {
+    const result = OllamaEmbedding.init(
+        std.testing.allocator,
+        "nomic-embed-text",
+        "http://gpu-server:11434",
+        768,
+    );
+    try std.testing.expectError(error.InsecureEmbeddingApiUrl, result);
 }
 
 test "OllamaEmbedding embed empty text" {
