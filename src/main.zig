@@ -27,6 +27,7 @@ const Command = enum {
     skills,
     hardware,
     migrate,
+    memory,
     models,
     auth,
     update,
@@ -50,6 +51,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "skills", .skills },
         .{ "hardware", .hardware },
         .{ "migrate", .migrate },
+        .{ "memory", .memory },
         .{ "models", .models },
         .{ "auth", .auth },
         .{ "update", .update },
@@ -99,6 +101,7 @@ pub fn main() !void {
         .skills => try runSkills(allocator, sub_args),
         .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
+        .memory => try runMemory(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
@@ -608,6 +611,277 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.debug.print("Unknown migration source: {s}\n", .{sub_args[0]});
         std.process.exit(1);
     }
+}
+
+// ── Memory ───────────────────────────────────────────────────────
+
+fn printMemoryUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw memory <command> [args]
+        \\
+        \\Commands:
+        \\  stats                         Show resolved memory config and key counters
+        \\  doctor | status               Run deep memory diagnostics report
+        \\  count                         Show total number of memory entries
+        \\  reindex                       Rebuild vector index from primary memory
+        \\  search <query> [--limit N]    Run runtime retrieval (keyword/hybrid)
+        \\  get <key>                     Show a single memory entry by key
+        \\  list [--category C] [--limit N]
+        \\                                List memory entries (default limit: 20)
+        \\  drain-outbox                  Drain durable vector outbox queue
+        \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\
+    , .{});
+}
+
+fn parsePositiveUsize(arg: []const u8) ?usize {
+    const n = std.fmt.parseInt(usize, arg, 10) catch return null;
+    if (n == 0) return null;
+    return n;
+}
+
+fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
+    const kw_rank: []const u8 = if (c.keyword_rank != null) "yes" else "no";
+    const vec_score: f32 = c.vector_score orelse -1.0;
+    if (c.vector_score) |_| {
+        std.debug.print("     score={d:.4} keyword_ranked={s} vector_score={d:.4} source={s}\n", .{
+            c.final_score,
+            kw_rank,
+            vec_score,
+            c.source,
+        });
+    } else {
+        std.debug.print("     score={d:.4} keyword_ranked={s} vector_score=n/a source={s}\n", .{
+            c.final_score,
+            kw_rank,
+            c.source,
+        });
+    }
+}
+
+fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printMemoryUsage();
+        std.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
+        std.debug.print("Memory runtime init failed. Check memory config and logs.\n", .{});
+        std.process.exit(1);
+    };
+    defer mem_rt.deinit();
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "stats")) {
+        const r = mem_rt.resolved;
+        const report = mem_rt.diagnose();
+        std.debug.print("Memory stats:\n", .{});
+        std.debug.print("  backend: {s}\n", .{r.primary_backend});
+        std.debug.print("  retrieval: {s}\n", .{r.retrieval_mode});
+        std.debug.print("  vector: {s}\n", .{r.vector_mode});
+        std.debug.print("  embedding: {s}\n", .{r.embedding_provider});
+        std.debug.print("  rollout: {s}\n", .{r.rollout_mode});
+        std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
+        std.debug.print("  sources: {d}\n", .{r.source_count});
+        std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
+        std.debug.print("  entries: {d}\n", .{report.entry_count});
+        if (report.vector_entry_count) |n| {
+            std.debug.print("  vector_entries: {d}\n", .{n});
+        } else {
+            std.debug.print("  vector_entries: n/a\n", .{});
+        }
+        if (report.outbox_pending) |n| {
+            std.debug.print("  outbox_pending: {d}\n", .{n});
+        } else {
+            std.debug.print("  outbox_pending: n/a\n", .{});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "doctor") or std.mem.eql(u8, subcmd, "status")) {
+        const report = mem_rt.diagnose();
+        const text = yc.memory.formatDiagnosticReport(report, allocator) catch |err| {
+            std.debug.print("memory doctor formatting failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer allocator.free(text);
+        std.debug.print("{s}\n", .{text});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "count")) {
+        const count = mem_rt.memory.count() catch |err| {
+            std.debug.print("memory count failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.debug.print("{d}\n", .{count});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "reindex")) {
+        const count = mem_rt.reindex(allocator);
+        if (std.mem.eql(u8, mem_rt.resolved.vector_mode, "none")) {
+            std.debug.print("Vector plane is disabled; reindex skipped (0 entries).\n", .{});
+        } else {
+            std.debug.print("Reindex complete: {d} entries reindexed.\n", .{count});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "drain-outbox")) {
+        const drained = mem_rt.drainOutbox(allocator);
+        std.debug.print("Outbox drain complete: {d} operation(s) processed.\n", .{drained});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "forget")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory forget <key>\n", .{});
+            std.process.exit(1);
+        }
+        const key = sub_args[1];
+        const deleted = mem_rt.memory.forget(key) catch |err| {
+            std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (deleted) {
+            mem_rt.deleteFromVectorStore(key);
+            std.debug.print("Deleted memory entry: {s}\n", .{key});
+        } else {
+            std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "get")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory get <key>\n", .{});
+            std.process.exit(1);
+        }
+        const key = sub_args[1];
+        const entry = mem_rt.memory.get(allocator, key) catch |err| {
+            std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (entry) |e| {
+            defer e.deinit(allocator);
+            std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
+                e.key,
+                e.category.toString(),
+                e.timestamp,
+                e.content,
+            });
+        } else {
+            std.debug.print("Not found: {s}\n", .{key});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        var limit: usize = 20;
+        var category_opt: ?yc.memory.MemoryCategory = null;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--category")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else {
+                std.debug.print("Unknown option for memory list: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const entries = mem_rt.memory.list(allocator, category_opt, null) catch |err| {
+            std.debug.print("memory list failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeEntries(allocator, entries);
+
+        const shown = @min(limit, entries.len);
+        std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, entries.len });
+        for (entries[0..shown], 0..) |e, idx| {
+            const preview_len = @min(@as(usize, 120), e.content.len);
+            const preview = e.content[0..preview_len];
+            std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
+                idx + 1,
+                e.key,
+                e.category.toString(),
+                e.timestamp,
+                preview,
+                if (e.content.len > preview_len) "..." else "",
+            });
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "search")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
+            std.process.exit(1);
+        }
+        const query = sub_args[1];
+        var limit: usize = 6;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else {
+                std.debug.print("Unknown option for memory search: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const results = mem_rt.search(allocator, query, limit, null) catch |err| {
+            std.debug.print("memory search failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.retrieval.freeCandidates(allocator, results);
+
+        std.debug.print("Search results: {d}\n", .{results.len});
+        for (results, 0..) |c, idx| {
+            std.debug.print("  {d}. {s} [{s}]\n", .{ idx + 1, c.key, c.category.toString() });
+            printRetrievalScoreLine(c);
+            const preview_len = @min(@as(usize, 140), c.snippet.len);
+            const preview = c.snippet[0..preview_len];
+            std.debug.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+        }
+        return;
+    }
+
+    std.debug.print("Unknown memory command: {s}\n\n", .{subcmd});
+    printMemoryUsage();
+    std.process.exit(1);
 }
 
 // ── Models ───────────────────────────────────────────────────────
@@ -1793,6 +2067,7 @@ fn printUsage() void {
         \\  skills      Manage skills
         \\  hardware    Discover and manage hardware
         \\  migrate     Migrate data from other agent runtimes
+        \\  memory      Inspect and maintain memory subsystem
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
         \\  update      Check for and install updates
@@ -1810,6 +2085,7 @@ fn printUsage() void {
         \\  skills <list|install|remove> [ARGS]
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
+        \\  memory <stats|doctor|status|count|reindex|search|get|list|drain-outbox|forget> [ARGS]
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
         \\  update [--check] [--yes]
@@ -1826,10 +2102,19 @@ test "parse known commands" {
     try std.testing.expectEqual(.version, parseCommand("-V").?);
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
+    try std.testing.expectEqual(.memory, parseCommand("memory").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "parsePositiveUsize accepts only positive integers" {
+    try std.testing.expectEqual(@as(?usize, 1), parsePositiveUsize("1"));
+    try std.testing.expectEqual(@as(?usize, 42), parsePositiveUsize("42"));
+    try std.testing.expect(parsePositiveUsize("0") == null);
+    try std.testing.expect(parsePositiveUsize("-1") == null);
+    try std.testing.expect(parsePositiveUsize("bad") == null);
 }
 
 test "applyGatewayDaemonOverrides applies CLI port before validation" {
