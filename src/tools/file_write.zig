@@ -197,7 +197,7 @@ pub const FileWriteTool = struct {
         }
 
         const msg = try std.fmt.allocPrint(allocator, "Written {d} bytes to {s}", .{ content.len, path });
-        return ToolResult{ .success = true, .output = msg };
+        return ToolResult{ .success = true, .output = msg, .error_msg = null };
     }
 };
 
@@ -412,8 +412,8 @@ test "file_write does not mutate outside inode through hard link" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
+    try std.testing.expect(result.error_msg == null);
 
     const workspace_actual = try ws_tmp.dir.readFileAlloc(std.testing.allocator, "hl.txt", 1024);
     defer std.testing.allocator.free(workspace_actual);
