@@ -62,28 +62,39 @@ pub const FileWriteTool = struct {
         };
         defer if (resolved_target) |rt| allocator.free(rt);
 
-        if (resolved_target) |resolved| {
-            if (!isResolvedPathAllowed(allocator, resolved, ws_path, self.allowed_paths)) {
-                return ToolResult.fail("Path is outside allowed areas");
-            }
-        } else {
-            const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
-            const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
-                const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
+        // Always validate against the nearest existing ancestor.
+        // For hard links this is the security boundary we care about, because we
+        // write through temp+rename (inode swap) rather than in-place mutation.
+        const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+        const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        defer allocator.free(resolved_ancestor);
+
+        if (!isResolvedPathAllowed(allocator, resolved_ancestor, ws_path, self.allowed_paths)) {
+            return ToolResult.fail("Path is outside allowed areas");
+        }
+
+        const existing_is_symlink = if (resolved_target != null) blk: {
+            break :blk isSymlinkPath(full_path) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to inspect path: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
-            defer allocator.free(resolved_ancestor);
+        } else false;
 
-            if (!isResolvedPathAllowed(allocator, resolved_ancestor, ws_path, self.allowed_paths)) {
+        // For symlinks, require target to stay within allowed areas.
+        if (existing_is_symlink) {
+            const resolved = resolved_target.?;
+            if (!isResolvedPathAllowed(allocator, resolved, ws_path, self.allowed_paths)) {
                 return ToolResult.fail("Path is outside allowed areas");
             }
         }
 
-        // For existing paths, write to canonical target path.
-        // This preserves symlink semantics (updates target, keeps link) and
-        // avoids platform-specific readLink failures on regular files.
-        const write_path = if (resolved_target) |resolved|
-            try allocator.dupe(u8, resolved)
+        // For symlinks, write to canonical target path to preserve link.
+        // For regular files/hard links, write via requested path.
+        const write_path = if (existing_is_symlink)
+            try allocator.dupe(u8, resolved_target.?)
         else
             try allocator.dupe(u8, full_path);
         defer allocator.free(write_path);
@@ -210,6 +221,24 @@ fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8
         },
         else => return err,
     };
+}
+
+fn isSymlinkPath(path: []const u8) !bool {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    const entry_name = std.fs.path.basename(path);
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        try std.fs.openDirAbsolute(dir_path, .{})
+    else
+        try std.fs.cwd().openDir(dir_path, .{});
+    defer dir.close();
+
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
+        error.NotLink => return false,
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
