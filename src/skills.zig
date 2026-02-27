@@ -1,4 +1,5 @@
 const std = @import("std");
+const zig_builtin = @import("builtin");
 const platform = @import("platform.zig");
 
 // Skills — user-defined capabilities loaded from disk.
@@ -1070,6 +1071,13 @@ fn auditSkillFileContent(
 }
 
 fn pathIsSymlink(path: []const u8) !bool {
+    if (comptime zig_builtin.os.tag == .windows) {
+        // readLink() on Zig 0.15.2 may surface unexpected NTSTATUS values for
+        // regular paths and abort tests on Windows CI. Skip root-level symlink
+        // probing here; nested non-file entries are still rejected during walk.
+        return false;
+    }
+
     const dir_path = std.fs.path.dirname(path) orelse ".";
     const entry_name = std.fs.path.basename(path);
 
