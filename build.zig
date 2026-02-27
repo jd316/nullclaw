@@ -242,7 +242,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.25";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.26";
     const channels_raw = b.option(
         []const u8,
         "channels",
@@ -309,11 +309,6 @@ pub fn build(b: *std.Build) void {
         break :blk sqlite3_artifact;
     } else null;
 
-    const sentry_dep = b.dependency("sentry_zig", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     var build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
     build_options.addOption(bool, "enable_memory_none", enable_memory_none);
@@ -353,7 +348,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         module.addImport("build_options", build_options_module);
-        module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
@@ -379,9 +373,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options_module);
-    if (!is_wasi) {
-        exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
-    }
 
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
