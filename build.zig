@@ -21,6 +21,25 @@ const VENDORED_SQLITE_HASHES = [_]VendoredFileHash{
     },
 };
 
+fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var chunk_start: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') {
+            if (i > chunk_start) hasher.update(bytes[chunk_start..i]);
+            hasher.update("\n");
+            i += 1;
+            chunk_start = i + 1;
+        }
+    }
+    if (chunk_start < bytes.len) hasher.update(bytes[chunk_start..]);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 fn verifyVendoredSqliteHashes(b: *std.Build) !void {
     const max_vendor_file_size = 16 * 1024 * 1024;
     for (VENDORED_SQLITE_HASHES) |entry| {
@@ -33,8 +52,7 @@ fn verifyVendoredSqliteHashes(b: *std.Build) !void {
         };
         defer b.allocator.free(bytes);
 
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const digest = hashWithCanonicalLineEndings(bytes);
 
         const actual_hex_buf = std.fmt.bytesToHex(digest, .lower);
         const actual_hex = actual_hex_buf[0..];
