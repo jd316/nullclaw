@@ -3,7 +3,7 @@
 //! Mirrors ZeroClaw's onboard module:
 //!   - Interactive wizard (9-step configuration flow)
 //!   - Quick setup (non-interactive, sensible defaults)
-//!   - Workspace scaffolding (MEMORY.md + prompt context files)
+//!   - Workspace scaffolding (prompt context files + bootstrap lifecycle)
 //!   - Channel configuration
 //!   - Memory backend selection
 //!   - Provider/model selection with curated defaults
@@ -1544,11 +1544,6 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
 
     const had_legacy_user_content = try hasLegacyUserContentIndicators(allocator, workspace_dir);
 
-    // MEMORY.md
-    const mem_tmpl = try memoryTemplate(allocator, ctx);
-    defer allocator.free(mem_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "MEMORY.md", mem_tmpl);
-
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
     defer allocator.free(soul_tmpl);
@@ -1576,14 +1571,6 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
     try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content);
-
-    // Ensure memory/ subdirectory
-    const mem_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
-    defer allocator.free(mem_dir);
-    std.fs.makeDirAbsolute(mem_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
@@ -2088,7 +2075,7 @@ test "BANNER contains descriptive text" {
     try std.testing.expect(std.mem.indexOf(u8, BANNER, "smallest AI assistant") != null);
 }
 
-test "scaffoldWorkspace creates files in temp dir" {
+test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2098,19 +2085,15 @@ test "scaffoldWorkspace creates files in temp dir" {
     const ctx = ProjectContext{};
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
 
-    // Verify files were created
-    const file = try tmp.dir.openFile("MEMORY.md", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
-    defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, content, "Memory") != null);
-
+    // Verify core files were created
     const agents = try tmp.dir.openFile("AGENTS.md", .{});
     defer agents.close();
     const agents_content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
     defer std.testing.allocator.free(agents_content);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+
+    // OpenClaw-style scaffold keeps MEMORY.md optional (created on demand by memory writes).
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
 }
 
 test "scaffoldWorkspace is idempotent" {
@@ -2396,7 +2379,7 @@ test "memoryTemplate uses context values" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "TestBot") != null);
 }
 
-test "scaffoldWorkspace creates memory subdirectory" {
+test "scaffoldWorkspace does not create memory subdirectory by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2404,10 +2387,7 @@ test "scaffoldWorkspace creates memory subdirectory" {
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
-
-    // Verify memory/ subdirectory exists
-    var d = try tmp.dir.openDir("memory", .{});
-    d.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
 }
 
 test "BANNER is non-empty and contains nullclaw branding" {
@@ -2554,7 +2534,7 @@ test "bootstrapTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "BOOTSTRAP.md - Hello, World") != null);
 }
 
-test "scaffoldWorkspace creates all prompt.zig files" {
+test "scaffoldWorkspace creates core prompt.zig files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2563,11 +2543,12 @@ test "scaffoldWorkspace creates all prompt.zig files" {
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
 
-    // Verify all files that prompt.zig tries to load exist
+    // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
-        "MEMORY.md",    "SOUL.md",      "AGENTS.md",
-        "TOOLS.md",     "IDENTITY.md",  "USER.md",
-        "HEARTBEAT.md", "BOOTSTRAP.md",
+        "SOUL.md",      "AGENTS.md",
+        "TOOLS.md",     "IDENTITY.md",
+        "USER.md",      "HEARTBEAT.md",
+        "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {
