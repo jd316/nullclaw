@@ -450,7 +450,12 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("Usage: nullclaw skills install <source>\n", .{});
             std.process.exit(1);
         }
-        yc.skills.installSkillFromPath(allocator, sub_args[1], cfg.workspace_dir) catch |err| {
+        var install_error_detail: ?[]u8 = null;
+        defer if (install_error_detail) |msg| allocator.free(msg);
+        yc.skills.installSkillWithDetail(allocator, sub_args[1], cfg.workspace_dir, &install_error_detail) catch |err| {
+            if (install_error_detail) |msg| {
+                std.debug.print("{s}\n", .{msg});
+            }
             std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };

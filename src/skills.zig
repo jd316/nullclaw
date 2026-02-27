@@ -4,8 +4,8 @@ const platform = @import("platform.zig");
 // Skills — user-defined capabilities loaded from disk.
 //
 // Each skill lives in ~/.nullclaw/workspace/skills/<name>/ with:
-//   - skill.json  — manifest (name, version, description, author)
-//   - SKILL.md    — optional instruction text
+//   - skill.json  — manifest (name, version, description, author), optional for markdown-only skills
+//   - SKILL.md    — instruction text (required for markdown-only skills)
 //
 // The skillforge module handles discovery and evaluation;
 // this module handles definition, loading, installation, and removal.
@@ -180,37 +180,71 @@ pub fn parseManifestAlloc(allocator: std.mem.Allocator, json_bytes: []const u8) 
 // ── Skill Loading ───────────────────────────────────────────────
 
 /// Load a single skill from a directory.
-/// Reads skill.json (required) and SKILL.md (optional) from skill_dir_path.
+/// Reads skill.json (preferred) and SKILL.md (optional for manifest-based skills).
+/// If skill.json is missing but SKILL.md exists, loads a markdown-only skill using
+/// the directory name as skill name (zeroclaw-compatible behavior).
 pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skill {
-    // Read skill.json
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_dir_path});
     defer allocator.free(manifest_path);
-
-    const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch
-        return error.ManifestNotFound;
-    defer allocator.free(manifest_bytes);
-
-    const manifest = parseManifestAlloc(allocator, manifest_bytes) catch
-        (parseManifest(manifest_bytes) catch return error.InvalidManifest);
-
-    // Dupe all strings so they outlive the manifest_bytes buffer
-    const name = try allocator.dupe(u8, manifest.name);
-    errdefer allocator.free(name);
-    const version = try allocator.dupe(u8, manifest.version);
-    errdefer allocator.free(version);
-    const description = try allocator.dupe(u8, manifest.description);
-    errdefer allocator.free(description);
-    const author = try allocator.dupe(u8, manifest.author);
-    errdefer allocator.free(author);
-    const path = try allocator.dupe(u8, skill_dir_path);
-    errdefer allocator.free(path);
-
-    // Try to read SKILL.md (optional)
     const instructions_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{skill_dir_path});
     defer allocator.free(instructions_path);
 
+    const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return error.ManifestNotFound,
+    };
+    defer if (manifest_bytes) |bytes| allocator.free(bytes);
+
+    if (manifest_bytes) |manifest_bytes_nonnull| {
+        const manifest = parseManifestAlloc(allocator, manifest_bytes_nonnull) catch
+            (parseManifest(manifest_bytes_nonnull) catch return error.InvalidManifest);
+
+        // Dupe all strings so they outlive the manifest_bytes buffer
+        const name = try allocator.dupe(u8, manifest.name);
+        errdefer allocator.free(name);
+        const version = try allocator.dupe(u8, manifest.version);
+        errdefer allocator.free(version);
+        const description = try allocator.dupe(u8, manifest.description);
+        errdefer allocator.free(description);
+        const author = try allocator.dupe(u8, manifest.author);
+        errdefer allocator.free(author);
+        const path = try allocator.dupe(u8, skill_dir_path);
+        errdefer allocator.free(path);
+
+        const instructions = std.fs.cwd().readFileAlloc(allocator, instructions_path, 256 * 1024) catch
+            try allocator.dupe(u8, "");
+
+        return Skill{
+            .name = name,
+            .version = version,
+            .description = description,
+            .author = author,
+            .instructions = instructions,
+            .enabled = true,
+            .always = manifest.always,
+            .requires_bins = manifest.requires_bins,
+            .requires_env = manifest.requires_env,
+            .path = path,
+        };
+    }
+
     const instructions = std.fs.cwd().readFileAlloc(allocator, instructions_path, 256 * 1024) catch
-        try allocator.dupe(u8, "");
+        return error.ManifestNotFound;
+    errdefer allocator.free(instructions);
+
+    const dirname = std.fs.path.basename(skill_dir_path);
+    try validateSkillName(dirname);
+
+    const name = try allocator.dupe(u8, dirname);
+    errdefer allocator.free(name);
+    const version = try allocator.dupe(u8, "0.0.1");
+    errdefer allocator.free(version);
+    const description = try allocator.dupe(u8, "");
+    errdefer allocator.free(description);
+    const author = try allocator.dupe(u8, "");
+    errdefer allocator.free(author);
+    const path = try allocator.dupe(u8, skill_dir_path);
+    errdefer allocator.free(path);
 
     return Skill{
         .name = name,
@@ -219,9 +253,9 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         .author = author,
         .instructions = instructions,
         .enabled = true,
-        .always = manifest.always,
-        .requires_bins = manifest.requires_bins,
-        .requires_env = manifest.requires_env,
+        .always = false,
+        .requires_bins = &.{},
+        .requires_env = &.{},
         .path = path,
     };
 }
@@ -391,26 +425,403 @@ pub fn listSkillsMerged(allocator: std.mem.Allocator, builtin_dir: []const u8, w
 
 // ── Installation ────────────────────────────────────────────────
 
-/// Install a skill by copying its directory into workspace_dir/skills/<name>/.
-/// source_path must contain a valid skill.json.
-pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u8, workspace_dir: []const u8) !void {
-    // Validate source has a manifest
-    const src_manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{source_path});
-    defer allocator.free(src_manifest_path);
+/// Detect whether source looks like a git remote URL/path.
+/// Accepted:
+/// - https://host/owner/repo(.git)
+/// - ssh://git@host/owner/repo(.git)
+/// - git@host:owner/repo(.git)
+fn isGitSource(source: []const u8) bool {
+    return isGitSchemeSource(source, "https://") or
+        isGitSchemeSource(source, "ssh://") or
+        isGitScpSource(source);
+}
 
-    const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, src_manifest_path, 64 * 1024) catch
+fn isInsecureGitSource(source: []const u8) bool {
+    return isGitSchemeSource(source, "http://") or
+        isGitSchemeSource(source, "git://");
+}
+
+fn isGitSchemeSource(source: []const u8, scheme: []const u8) bool {
+    if (!std.mem.startsWith(u8, source, scheme)) return false;
+    const rest = source[scheme.len..];
+    if (rest.len == 0) return false;
+    if (rest[0] == '/' or rest[0] == '\\') return false;
+
+    const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const host = rest[0..host_end];
+    return host.len > 0;
+}
+
+fn isGitScpSource(source: []const u8) bool {
+    // SCP-like syntax accepted by git, e.g. git@host:owner/repo.git
+    if (std.mem.indexOf(u8, source, "://") != null) return false;
+
+    const colon_pos = std.mem.indexOfScalar(u8, source, ':') orelse return false;
+    const user_host = source[0..colon_pos];
+    const remote_path = source[colon_pos + 1 ..];
+    if (remote_path.len == 0) return false;
+
+    const at_pos = std.mem.indexOfScalar(u8, user_host, '@') orelse return false;
+    const user = user_host[0..at_pos];
+    const host = user_host[at_pos + 1 ..];
+    if (user.len == 0 or host.len == 0) return false;
+
+    for (user) |c| {
+        if (c == '/' or c == '\\') return false;
+    }
+    for (host) |c| {
+        if (c == '/' or c == '\\') return false;
+    }
+    return true;
+}
+
+fn clearInstallErrorDetail(allocator: std.mem.Allocator, detail_out: ?*?[]u8) void {
+    if (detail_out) |slot| {
+        if (slot.*) |old| allocator.free(old);
+        slot.* = null;
+    }
+}
+
+fn setInstallErrorDetail(allocator: std.mem.Allocator, detail_out: ?*?[]u8, detail: []const u8) void {
+    if (detail_out) |slot| {
+        if (slot.*) |old| allocator.free(old);
+        slot.* = allocator.dupe(u8, detail) catch null;
+    }
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var matched = true;
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
+fn classifyGitCloneError(stderr: []const u8) anyerror {
+    if (containsAsciiIgnoreCase(stderr, "could not resolve host") or
+        containsAsciiIgnoreCase(stderr, "failed to connect") or
+        containsAsciiIgnoreCase(stderr, "network is unreachable") or
+        containsAsciiIgnoreCase(stderr, "timed out")) return error.GitCloneNetworkError;
+
+    if (containsAsciiIgnoreCase(stderr, "authentication failed") or
+        containsAsciiIgnoreCase(stderr, "permission denied") or
+        containsAsciiIgnoreCase(stderr, "could not read from remote repository")) return error.GitCloneAuthFailed;
+
+    if ((containsAsciiIgnoreCase(stderr, "repository") and
+        containsAsciiIgnoreCase(stderr, "not found")) or
+        containsAsciiIgnoreCase(stderr, "returned error: 404")) return error.GitCloneRepositoryNotFound;
+
+    return error.GitCloneFailed;
+}
+
+fn validateSkillName(name: []const u8) !void {
+    for (name) |c| {
+        if (c == '/' or c == '\\' or c == '"' or c == 0) return error.UnsafeName;
+        if (c < 0x20) return error.UnsafeName;
+    }
+    if (name.len == 0 or std.mem.eql(u8, name, "..")) return error.UnsafeName;
+}
+
+fn readValidatedManifestName(allocator: std.mem.Allocator, skill_dir_path: []const u8) ![]u8 {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_dir_path});
+    defer allocator.free(manifest_path);
+
+    const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch
         return error.ManifestNotFound;
     defer allocator.free(manifest_bytes);
 
     const manifest = parseManifest(manifest_bytes) catch return error.InvalidManifest;
+    try validateSkillName(manifest.name);
+    return try allocator.dupe(u8, manifest.name);
+}
 
-    // Sanitize skill name for safe path usage
-    for (manifest.name) |c| {
-        if (c == '/' or c == '\\' or c == 0) return error.UnsafeName;
+const SKILL_AUDIT_MAX_FILE_BYTES: usize = 512 * 1024;
+const SKILL_AUDIT_BLOCKED_PATTERNS = [_][]const u8{
+    "rm -rf /",
+    "sudo rm -rf /",
+    "dd if=/dev/zero",
+    "mkfs",
+    "curl | sh",
+    "wget | sh",
+    "chmod 777 /",
+    ":(){:|:&};:",
+};
+
+fn shouldAuditFileContent(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    if (std.mem.eql(u8, name, "SKILL.md") or std.mem.eql(u8, name, "SKILL.toml")) return true;
+    return std.mem.endsWith(u8, name, ".sh") or
+        std.mem.endsWith(u8, name, ".bash") or
+        std.mem.endsWith(u8, name, ".zsh") or
+        std.mem.endsWith(u8, name, ".command") or
+        std.mem.endsWith(u8, name, ".ps1") or
+        std.mem.endsWith(u8, name, ".bat") or
+        std.mem.endsWith(u8, name, ".cmd");
+}
+
+fn auditSkillFileContent(allocator: std.mem.Allocator, file_path: []const u8) !void {
+    if (!shouldAuditFileContent(file_path)) return;
+
+    const content = std.fs.cwd().readFileAlloc(allocator, file_path, SKILL_AUDIT_MAX_FILE_BYTES) catch
+        return error.SkillSecurityAuditFailed;
+    defer allocator.free(content);
+
+    if (std.mem.indexOfScalar(u8, content, 0) != null) return; // likely binary
+
+    for (SKILL_AUDIT_BLOCKED_PATTERNS) |pattern| {
+        if (containsAsciiIgnoreCase(content, pattern)) {
+            return error.SkillSecurityAuditFailed;
+        }
     }
-    if (manifest.name.len == 0 or std.mem.eql(u8, manifest.name, "..")) return error.UnsafeName;
+}
 
-    // Ensure skills directory exists
+fn pathIsSymlink(path: []const u8) !bool {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    const entry_name = std.fs.path.basename(path);
+
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        try std.fs.openDirAbsolute(dir_path, .{})
+    else
+        try std.fs.cwd().openDir(dir_path, .{});
+    defer dir.close();
+
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
+        error.NotLink => return false,
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn auditSkillDirectory(allocator: std.mem.Allocator, root_dir_path: []const u8) !void {
+    if (try pathIsSymlink(root_dir_path)) return error.SkillSecurityAuditFailed;
+
+    var stack: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (stack.items) |p| allocator.free(p);
+        stack.deinit(allocator);
+    }
+    try stack.append(allocator, try allocator.dupe(u8, root_dir_path));
+
+    while (stack.items.len > 0) {
+        const current = stack.pop().?;
+        defer allocator.free(current);
+
+        var dir = if (std.fs.path.isAbsolute(current))
+            std.fs.openDirAbsolute(current, .{ .iterate = true }) catch
+                return error.SkillSecurityAuditFailed
+        else
+            std.fs.cwd().openDir(current, .{ .iterate = true }) catch
+                return error.SkillSecurityAuditFailed;
+        defer dir.close();
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            const entry_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current, entry.name });
+
+            if (entry.kind == .directory) {
+                try stack.append(allocator, entry_path);
+                continue;
+            }
+            if (entry.kind != .file) {
+                allocator.free(entry_path);
+                return error.SkillSecurityAuditFailed;
+            }
+
+            auditSkillFileContent(allocator, entry_path) catch |err| {
+                allocator.free(entry_path);
+                return err;
+            };
+            allocator.free(entry_path);
+        }
+    }
+
+    stack.deinit(allocator);
+}
+
+fn snapshotSkillChildren(allocator: std.mem.Allocator, skills_dir_path: []const u8) !std.StringHashMap(void) {
+    var paths = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var it = paths.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        paths.deinit();
+    }
+
+    var dir = try std.fs.openDirAbsolute(skills_dir_path, .{ .iterate = true });
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, entry.name });
+        errdefer allocator.free(child_path);
+        try paths.put(child_path, {});
+    }
+
+    return paths;
+}
+
+fn freePathSnapshot(allocator: std.mem.Allocator, paths: *std.StringHashMap(void)) void {
+    var it = paths.iterator();
+    while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+    paths.deinit();
+}
+
+fn detectNewlyInstalledDirectory(
+    allocator: std.mem.Allocator,
+    skills_dir_path: []const u8,
+    before: *const std.StringHashMap(void),
+) ![]u8 {
+    var created: ?[]u8 = null;
+    errdefer if (created) |p| allocator.free(p);
+
+    var dir = try std.fs.openDirAbsolute(skills_dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, entry.name });
+        if (before.contains(path)) {
+            allocator.free(path);
+            continue;
+        }
+
+        if (created != null) {
+            allocator.free(path);
+            return error.GitCloneAmbiguousDirectory;
+        }
+        created = path;
+    }
+
+    return created orelse error.GitCloneNoNewDirectory;
+}
+
+fn removeGitMetadata(skill_path: []const u8) !void {
+    var git_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const git_dir = std.fmt.bufPrint(&git_dir_buf, "{s}/.git", .{skill_path}) catch
+        return error.PathTooLong;
+    std.fs.deleteTreeAbsolute(git_dir) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn pathExists(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn writeGeneratedSkillManifest(allocator: std.mem.Allocator, target_dir: []const u8, skill_name: []const u8) !void {
+    const target_manifest = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{target_dir});
+    defer allocator.free(target_manifest);
+    if (pathExists(target_manifest)) return;
+
+    const manifest_json = try std.fmt.allocPrint(allocator, "{{\"name\": \"{s}\"}}", .{skill_name});
+    defer allocator.free(manifest_json);
+    const f = try std.fs.createFileAbsolute(target_manifest, .{});
+    defer f.close();
+    try f.writeAll(manifest_json);
+}
+
+fn hasSkillMarkers(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
+    const md = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{dir_path});
+    defer allocator.free(md);
+    if (pathExists(md)) return true;
+
+    const toml = try std.fmt.allocPrint(allocator, "{s}/SKILL.toml", .{dir_path});
+    defer allocator.free(toml);
+    return pathExists(toml);
+}
+
+const CopyDirPair = struct {
+    src: []u8,
+    dst: []u8,
+};
+
+fn copyDirRecursiveSecure(allocator: std.mem.Allocator, src_root: []const u8, dst_root: []const u8) !void {
+    var stack: std.ArrayListUnmanaged(CopyDirPair) = .empty;
+    errdefer {
+        for (stack.items) |pair| {
+            allocator.free(pair.src);
+            allocator.free(pair.dst);
+        }
+        stack.deinit(allocator);
+    }
+    try stack.append(allocator, .{
+        .src = try allocator.dupe(u8, src_root),
+        .dst = try allocator.dupe(u8, dst_root),
+    });
+
+    while (stack.items.len > 0) {
+        const pair = stack.pop().?;
+        defer {
+            allocator.free(pair.src);
+            allocator.free(pair.dst);
+        }
+
+        var src_dir = if (std.fs.path.isAbsolute(pair.src))
+            std.fs.openDirAbsolute(pair.src, .{ .iterate = true }) catch
+                return error.ReadError
+        else
+            std.fs.cwd().openDir(pair.src, .{ .iterate = true }) catch
+                return error.ReadError;
+        defer src_dir.close();
+
+        var it = src_dir.iterate();
+        while (try it.next()) |entry| {
+            const src_child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pair.src, entry.name });
+            errdefer allocator.free(src_child);
+            const dst_child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pair.dst, entry.name });
+            errdefer allocator.free(dst_child);
+
+            if (entry.kind == .directory) {
+                std.fs.makeDirAbsolute(dst_child) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+                try stack.append(allocator, .{
+                    .src = src_child,
+                    .dst = dst_child,
+                });
+                continue;
+            }
+            if (entry.kind != .file) return error.SkillSecurityAuditFailed;
+
+            try copyFilePath(src_child, dst_child);
+            allocator.free(src_child);
+            allocator.free(dst_child);
+        }
+    }
+
+    stack.deinit(allocator);
+}
+
+fn installSkillDirectoryToWorkspace(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    workspace_dir: []const u8,
+    skill_name: []const u8,
+    ensure_manifest: bool,
+) !void {
+    try validateSkillName(skill_name);
+    try auditSkillDirectory(allocator, source_path);
+
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
     defer allocator.free(skills_dir_path);
     std.fs.makeDirAbsolute(skills_dir_path) catch |err| switch (err) {
@@ -418,35 +829,306 @@ pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u
         else => return err,
     };
 
-    // Create target directory
-    const target_path = try std.fmt.allocPrint(allocator, "{s}/skills/{s}", .{ workspace_dir, manifest.name });
+    const target_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, skill_name });
     defer allocator.free(target_path);
+    const target_existed = pathExists(target_path);
+    if (target_existed) return error.SkillAlreadyExists;
     std.fs.makeDirAbsolute(target_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    // Copy skill.json
-    const dst_manifest = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{target_path});
-    defer allocator.free(dst_manifest);
-    try copyFileAbsolute(src_manifest_path, dst_manifest);
+    copyDirRecursiveSecure(allocator, source_path, target_path) catch |err| {
+        if (!target_existed) {
+            std.fs.deleteTreeAbsolute(target_path) catch {};
+        }
+        return err;
+    };
 
-    // Copy SKILL.md if present
-    const src_instructions = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{source_path});
-    defer allocator.free(src_instructions);
-    const dst_instructions = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{target_path});
-    defer allocator.free(dst_instructions);
-    copyFileAbsolute(src_instructions, dst_instructions) catch {
-        // SKILL.md is optional, ignore if missing
+    if (ensure_manifest) {
+        writeGeneratedSkillManifest(allocator, target_path, skill_name) catch |err| {
+            if (!target_existed) {
+                std.fs.deleteTreeAbsolute(target_path) catch {};
+            }
+            return err;
+        };
+    }
+
+    auditSkillDirectory(allocator, target_path) catch |err| {
+        if (!target_existed) {
+            std.fs.deleteTreeAbsolute(target_path) catch {};
+        }
+        return err;
     };
 }
 
-/// Copy a file from src to dst using absolute paths.
-fn copyFileAbsolute(src: []const u8, dst: []const u8) !void {
-    const src_file = try std.fs.openFileAbsolute(src, .{});
+fn deriveSkillNameFromSourcePath(allocator: std.mem.Allocator, source_path: []const u8) ![]u8 {
+    const trimmed = std.mem.trimRight(u8, source_path, "/\\");
+    if (trimmed.len == 0) return error.UnsafeName;
+    const base_name = std.fs.path.basename(trimmed);
+    try validateSkillName(base_name);
+    return try allocator.dupe(u8, base_name);
+}
+
+fn installSkillsFromRepositoryCollection(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !usize {
+    const collection_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{repo_root});
+    defer allocator.free(collection_path);
+
+    var collection_dir = if (std.fs.path.isAbsolute(collection_path))
+        std.fs.openDirAbsolute(collection_path, .{ .iterate = true }) catch
+            return error.ManifestNotFound
+    else
+        std.fs.cwd().openDir(collection_path, .{ .iterate = true }) catch
+            return error.ManifestNotFound;
+    defer collection_dir.close();
+
+    var installed_count: usize = 0;
+    var it = collection_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+
+        const skill_source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ collection_path, entry.name });
+        defer allocator.free(skill_source_path);
+        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_source_path});
+        defer allocator.free(manifest_path);
+
+        if (pathExists(manifest_path)) {
+            installSkillFromPath(allocator, skill_source_path, workspace_dir) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "failed to install skill from repository collection entry '{s}'", .{entry.name}) catch null;
+                if (msg) |m| {
+                    defer allocator.free(m);
+                    setInstallErrorDetail(allocator, detail_out, m);
+                }
+                return err;
+            };
+            installed_count += 1;
+            continue;
+        }
+
+        if (!(hasSkillMarkers(allocator, skill_source_path) catch false)) continue;
+
+        installSkillDirectoryToWorkspace(allocator, skill_source_path, workspace_dir, entry.name, true) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "failed to install marker-based skill from repository collection entry '{s}'", .{entry.name}) catch null;
+            if (msg) |m| {
+                defer allocator.free(m);
+                setInstallErrorDetail(allocator, detail_out, m);
+            }
+            return err;
+        };
+        installed_count += 1;
+    }
+
+    if (installed_count == 0) {
+        return error.ManifestNotFound;
+    }
+    return installed_count;
+}
+
+fn installSkillFromGit(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
+    defer allocator.free(skills_dir_path);
+    std.fs.makeDirAbsolute(skills_dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var before = try snapshotSkillChildren(allocator, skills_dir_path);
+    defer freePathSnapshot(allocator, &before);
+
+    const clone_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "git", "clone", "--depth", "1", source },
+        .cwd = skills_dir_path,
+        .max_output_bytes = 64 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            setInstallErrorDetail(allocator, detail_out, "git is not available in PATH");
+            return error.GitNotAvailable;
+        },
+        else => return err,
+    };
+    defer {
+        allocator.free(clone_result.stdout);
+        allocator.free(clone_result.stderr);
+    }
+
+    switch (clone_result.term) {
+        .Exited => |code| if (code != 0) {
+            const stderr_trimmed = std.mem.trim(u8, clone_result.stderr, " \t\r\n");
+            if (stderr_trimmed.len > 0) {
+                const stderr_cap = stderr_trimmed[0..@min(stderr_trimmed.len, 2048)];
+                const msg = try std.fmt.allocPrint(allocator, "git clone failed (exit {d}): {s}", .{ code, stderr_cap });
+                defer allocator.free(msg);
+                setInstallErrorDetail(allocator, detail_out, msg);
+            } else {
+                setInstallErrorDetail(allocator, detail_out, "git clone failed");
+            }
+            return classifyGitCloneError(clone_result.stderr);
+        },
+        else => {
+            setInstallErrorDetail(allocator, detail_out, "git clone terminated unexpectedly");
+            return error.GitCloneFailed;
+        },
+    }
+
+    const cloned_dir = detectNewlyInstalledDirectory(allocator, skills_dir_path, &before) catch |err| {
+        switch (err) {
+            error.GitCloneNoNewDirectory => setInstallErrorDetail(allocator, detail_out, "git clone completed but no new skill directory was created"),
+            error.GitCloneAmbiguousDirectory => setInstallErrorDetail(allocator, detail_out, "git clone created multiple new directories; cannot determine installed skill path"),
+            else => {},
+        }
+        return err;
+    };
+    defer allocator.free(cloned_dir);
+
+    var cleanup_cloned_dir = true;
+    defer if (cleanup_cloned_dir) {
+        std.fs.deleteTreeAbsolute(cloned_dir) catch {};
+    };
+
+    auditSkillDirectory(allocator, cloned_dir) catch |err| {
+        setInstallErrorDetail(allocator, detail_out, "skill security audit failed on cloned repository");
+        return err;
+    };
+    try removeGitMetadata(cloned_dir);
+
+    const maybe_manifest_name = readValidatedManifestName(allocator, cloned_dir) catch |err| switch (err) {
+        error.ManifestNotFound => null,
+        else => return err,
+    };
+
+    if (maybe_manifest_name) |manifest_name| {
+        defer allocator.free(manifest_name);
+        const target_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, manifest_name });
+        defer allocator.free(target_path);
+
+        if (!std.mem.eql(u8, cloned_dir, target_path)) {
+            if (pathExists(target_path)) {
+                installSkillFromPath(allocator, cloned_dir, workspace_dir) catch |err| {
+                    setInstallErrorDetail(allocator, detail_out, "git clone succeeded, but skill import failed");
+                    return err;
+                };
+                return;
+            }
+            std.fs.renameAbsolute(cloned_dir, target_path) catch |err| {
+                setInstallErrorDetail(allocator, detail_out, "git clone succeeded, but failed to finalize skill directory name");
+                return err;
+            };
+            cleanup_cloned_dir = false;
+        }
+
+        auditSkillDirectory(allocator, target_path) catch |err| {
+            setInstallErrorDetail(allocator, detail_out, "skill security audit failed after installation");
+            return err;
+        };
+        cleanup_cloned_dir = false;
+        return;
+    }
+
+    if (try hasSkillMarkers(allocator, cloned_dir)) {
+        const clone_name = std.fs.path.basename(cloned_dir);
+        try validateSkillName(clone_name);
+        try writeGeneratedSkillManifest(allocator, cloned_dir, clone_name);
+        auditSkillDirectory(allocator, cloned_dir) catch |err| {
+            setInstallErrorDetail(allocator, detail_out, "skill security audit failed after installation");
+            return err;
+        };
+        cleanup_cloned_dir = false;
+        return;
+    }
+
+    const imported_count = installSkillsFromRepositoryCollection(allocator, cloned_dir, workspace_dir, detail_out) catch |err| {
+        if (err == error.ManifestNotFound) {
+            setInstallErrorDetail(
+                allocator,
+                detail_out,
+                "repository does not contain an installable skill.json at root or installable entries under skills/",
+            );
+        }
+        return err;
+    };
+    if (imported_count == 0) {
+        setInstallErrorDetail(
+            allocator,
+            detail_out,
+            "repository skills/ directory was found, but no installable skill entries were detected",
+        );
+        return error.ManifestNotFound;
+    }
+}
+
+/// Install a skill from either a local path or a git source URL, with optional error detail output.
+pub fn installSkillWithDetail(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    clearInstallErrorDetail(allocator, detail_out);
+    if (isInsecureGitSource(source)) {
+        setInstallErrorDetail(allocator, detail_out, "insecure git source is not allowed; use https://, ssh://, or git@host:path syntax");
+        return error.InsecureGitSource;
+    }
+    if (isGitSource(source)) {
+        return installSkillFromGit(allocator, source, workspace_dir, detail_out);
+    }
+    return installSkillFromPath(allocator, source, workspace_dir);
+}
+
+/// Install a skill from either a local path or a git source URL.
+pub fn installSkill(allocator: std.mem.Allocator, source: []const u8, workspace_dir: []const u8) !void {
+    return installSkillWithDetail(allocator, source, workspace_dir, null);
+}
+
+/// Install a skill by copying its directory into workspace_dir/skills/<name>/.
+/// If skill.json exists, its `name` is used.
+/// If skill.json is missing, falls back to directory basename when SKILL.md exists.
+pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u8, workspace_dir: []const u8) !void {
+    const source_abs = std.fs.cwd().realpathAlloc(allocator, source_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return error.ManifestNotFound,
+        else => return err,
+    };
+    defer allocator.free(source_abs);
+
+    const manifest_name = readValidatedManifestName(allocator, source_abs) catch |err| switch (err) {
+        error.ManifestNotFound => null,
+        else => return err,
+    };
+    defer if (manifest_name) |name| allocator.free(name);
+
+    if (manifest_name) |name| {
+        return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, name, false);
+    }
+
+    if (!(try hasSkillMarkers(allocator, source_abs))) return error.ManifestNotFound;
+
+    const fallback_name = try deriveSkillNameFromSourcePath(allocator, source_abs);
+    defer allocator.free(fallback_name);
+    return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, fallback_name, true);
+}
+
+/// Copy a file from src to dst. Supports both absolute and relative paths.
+fn copyFilePath(src: []const u8, dst: []const u8) !void {
+    const src_file = if (std.fs.path.isAbsolute(src))
+        try std.fs.openFileAbsolute(src, .{})
+    else
+        try std.fs.cwd().openFile(src, .{});
     defer src_file.close();
 
-    const dst_file = try std.fs.createFileAbsolute(dst, .{});
+    const dst_file = if (std.fs.path.isAbsolute(dst))
+        try std.fs.createFileAbsolute(dst, .{})
+    else
+        try std.fs.cwd().createFile(dst, .{});
     defer dst_file.close();
 
     // Read and write in chunks
@@ -808,6 +1490,22 @@ pub fn freeSyncResult(allocator: std.mem.Allocator, result: *const SyncResult) v
 
 // ── Tests ───────────────────────────────────────────────────────
 
+fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => return error.CommandNotFound,
+        else => return err,
+    };
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
 test "parseManifest full JSON" {
     const json =
         \\{"name": "code-review", "version": "1.2.0", "description": "Automated code review", "author": "nullclaw"}
@@ -1022,6 +1720,32 @@ test "loadSkill without SKILL.md still works" {
     try std.testing.expectEqualStrings("", skill.instructions);
 }
 
+test "loadSkill without skill.json falls back to markdown-only skill" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/md-only");
+    {
+        const f = try tmp.dir.createFile("skills/md-only/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Markdown Skill\nUse markdown-only format.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "md-only" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("md-only", skill.name);
+    try std.testing.expectEqualStrings("0.0.1", skill.version);
+    try std.testing.expectEqualStrings("# Markdown Skill\nUse markdown-only format.", skill.instructions);
+    try std.testing.expect(skill.available);
+}
+
 test "loadSkill missing manifest returns error" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1093,6 +1817,28 @@ test "listSkills discovers skills in subdirectories" {
     try std.testing.expect(found_beta);
 }
 
+test "listSkills discovers markdown-only skill directories" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/md-skill");
+    {
+        const f = try tmp.dir.createFile("skills/md-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# MD Skill\nWorks without skill.json.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const skills = try listSkills(allocator, base);
+    defer freeSkills(allocator, skills);
+
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("md-skill", skills[0].name);
+}
+
 test "listSkills skips directories without valid manifest" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1129,7 +1875,156 @@ test "listSkills skips directories without valid manifest" {
     try std.testing.expectEqualStrings("valid", skills[0].name);
 }
 
-test "installSkillFromPath and removeSkill roundtrip" {
+test "isGitSource accepts remote protocols and scp style" {
+    const sources = [_][]const u8{
+        "https://github.com/some-org/some-skill.git",
+        "ssh://git@github.com/some-org/some-skill.git",
+        "git@github.com:some-org/some-skill.git",
+        "git@localhost:skills/some-skill.git",
+    };
+
+    for (sources) |source| {
+        try std.testing.expect(isGitSource(source));
+    }
+}
+
+test "isInsecureGitSource detects blocked git schemes" {
+    const sources = [_][]const u8{
+        "http://github.com/some-org/some-skill.git",
+        "git://github.com/some-org/some-skill.git",
+    };
+
+    for (sources) |source| {
+        try std.testing.expect(isInsecureGitSource(source));
+        try std.testing.expect(!isGitSource(source));
+    }
+}
+
+test "isGitSource rejects local paths and invalid inputs" {
+    const sources = [_][]const u8{
+        "./skills/local-skill",
+        "/tmp/skills/local-skill",
+        "C:\\skills\\local-skill",
+        "git@github.com",
+        "ssh://",
+        "not-a-url",
+        "dir/git@github.com:org/repo.git",
+    };
+
+    for (sources) |source| {
+        try std.testing.expect(!isGitSource(source));
+    }
+}
+
+test "classifyGitCloneError maps common git clone failures" {
+    try std.testing.expectEqual(error.GitCloneRepositoryNotFound, classifyGitCloneError("fatal: repository 'x' not found"));
+    try std.testing.expectEqual(error.GitCloneRepositoryNotFound, classifyGitCloneError("fatal: unable to access 'https://example/repo.git/': The requested URL returned error: 404"));
+    try std.testing.expectEqual(error.GitCloneAuthFailed, classifyGitCloneError("fatal: could not read from remote repository"));
+    try std.testing.expectEqual(error.GitCloneNetworkError, classifyGitCloneError("fatal: could not resolve host: github.com"));
+    try std.testing.expectEqual(error.GitCloneFailed, classifyGitCloneError("fatal: unknown git clone failure"));
+}
+
+test "snapshotSkillChildren and detectNewlyInstalledDirectory roundtrip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace/skills/existing");
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skills_dir = try std.fs.path.join(allocator, &.{ base, "workspace", "skills" });
+    defer allocator.free(skills_dir);
+
+    var before = try snapshotSkillChildren(allocator, skills_dir);
+    defer freePathSnapshot(allocator, &before);
+
+    try tmp.dir.makePath("workspace/skills/newly-added");
+
+    const newly = try detectNewlyInstalledDirectory(allocator, skills_dir, &before);
+    defer allocator.free(newly);
+    try std.testing.expect(std.mem.endsWith(u8, newly, "/newly-added"));
+}
+
+test "detectNewlyInstalledDirectory errors for none and multiple directories" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace/skills/base");
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skills_dir = try std.fs.path.join(allocator, &.{ base, "workspace", "skills" });
+    defer allocator.free(skills_dir);
+
+    var before = try snapshotSkillChildren(allocator, skills_dir);
+    defer freePathSnapshot(allocator, &before);
+
+    try std.testing.expectError(error.GitCloneNoNewDirectory, detectNewlyInstalledDirectory(allocator, skills_dir, &before));
+
+    try tmp.dir.makePath("workspace/skills/new-a");
+    try tmp.dir.makePath("workspace/skills/new-b");
+    try std.testing.expectError(error.GitCloneAmbiguousDirectory, detectNewlyInstalledDirectory(allocator, skills_dir, &before));
+}
+
+test "auditSkillDirectory rejects symlink entries" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source");
+    {
+        const f = try tmp.dir.createFile("source/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"symlink-skill\"}");
+    }
+    try tmp.dir.symLink("/etc/passwd", "source/escape-link", .{});
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try std.testing.expectError(error.SkillSecurityAuditFailed, auditSkillDirectory(allocator, source));
+}
+
+test "auditSkillDirectory allows large non-script files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source/assets");
+    {
+        const f = try tmp.dir.createFile("source/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"large-asset-skill\"}");
+    }
+    {
+        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Skill with large asset");
+    }
+    {
+        const f = try tmp.dir.createFile("source/assets/blob.bin", .{});
+        defer f.close();
+        const buf = try allocator.alloc(u8, (SKILL_AUDIT_MAX_FILE_BYTES + 1024));
+        defer allocator.free(buf);
+        @memset(buf, 0x5a);
+        try f.writeAll(buf);
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try auditSkillDirectory(allocator, source);
+}
+
+test "installSkill and removeSkill roundtrip" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1162,7 +2057,7 @@ test "installSkillFromPath and removeSkill roundtrip" {
     defer allocator.free(source);
 
     // Install
-    try installSkillFromPath(allocator, source, workspace);
+    try installSkill(allocator, source, workspace);
 
     // Verify installed skill loads
     const skills = try listSkills(allocator, workspace);
@@ -1178,6 +2073,408 @@ test "installSkillFromPath and removeSkill roundtrip" {
     const after = try listSkills(allocator, workspace);
     defer freeSkills(allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "installSkillFromPath copies full source directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("source/assets");
+
+    {
+        const f = try tmp.dir.createFile("source/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"with-assets\", \"version\": \"1.0.0\"}");
+    }
+    {
+        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Skill with assets");
+    }
+    {
+        const f = try tmp.dir.createFile("source/assets/payload.txt", .{});
+        defer f.close();
+        try f.writeAll("asset-data");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try installSkillFromPath(allocator, source, workspace);
+
+    const installed_payload = try std.fs.path.join(allocator, &.{ workspace, "skills", "with-assets", "assets", "payload.txt" });
+    defer allocator.free(installed_payload);
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, installed_payload, 1024);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("asset-data", bytes);
+}
+
+test "installSkillFromPath supports markdown-only source directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("source-md");
+    {
+        const f = try tmp.dir.createFile("source-md/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Markdown only install");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const source = try std.fs.path.join(allocator, &.{ base, "source-md" });
+    defer allocator.free(source);
+
+    try installSkillFromPath(allocator, source, workspace);
+
+    const installed_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-md", "SKILL.md" });
+    defer allocator.free(installed_path);
+    const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("# Markdown only install", content);
+
+    const generated_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-md", "skill.json" });
+    defer allocator.free(generated_manifest);
+    try std.testing.expect(pathExists(generated_manifest));
+}
+
+test "installSkillFromPath supports relative source path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("source-rel");
+    {
+        const f = try tmp.dir.createFile("source-rel/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"relative-install\", \"version\": \"1.0.0\"}");
+    }
+    {
+        const f = try tmp.dir.createFile("source-rel/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Relative install skill");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const source_abs = try std.fs.path.join(allocator, &.{ base, "source-rel" });
+    defer allocator.free(source_abs);
+    const cwd_abs = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd_abs);
+    const source_rel = try std.fs.path.relative(allocator, cwd_abs, source_abs);
+    defer allocator.free(source_rel);
+
+    try installSkillFromPath(allocator, source_rel, workspace);
+
+    const installed = try std.fs.path.join(allocator, &.{ workspace, "skills", "relative-install", "SKILL.md" });
+    defer allocator.free(installed);
+    const content = try std.fs.cwd().readFileAlloc(allocator, installed, 1024);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("# Relative install skill", content);
+}
+
+test "installSkillFromPath supports SKILL.toml-only source directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("source-toml");
+    {
+        const f = try tmp.dir.createFile("source-toml/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "example-skill"
+            \\description = "toml-only"
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const source = try std.fs.path.join(allocator, &.{ base, "source-toml" });
+    defer allocator.free(source);
+
+    try installSkillFromPath(allocator, source, workspace);
+
+    const installed_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-toml", "skill.json" });
+    defer allocator.free(installed_manifest);
+    const manifest = try std.fs.cwd().readFileAlloc(allocator, installed_manifest, 1024);
+    defer allocator.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"name\": \"source-toml\"") != null);
+}
+
+test "installSkillWithDetail rejects insecure git source" {
+    const allocator = std.testing.allocator;
+    var detail: ?[]u8 = null;
+    defer if (detail) |msg| allocator.free(msg);
+
+    try std.testing.expectError(
+        error.InsecureGitSource,
+        installSkillWithDetail(allocator, "http://github.com/some-org/some-skill.git", "/tmp", &detail),
+    );
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "insecure git source") != null);
+}
+
+test "installSkillFromGit installs from local git repository" {
+    const allocator = std.testing.allocator;
+    if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("repo");
+
+    {
+        const rel = try std.fs.path.join(allocator, &.{ "repo", "skill.json" });
+        defer allocator.free(rel);
+        const f = try tmp.dir.createFile(rel, .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"git-install\", \"version\": \"1.0.0\"}");
+    }
+    {
+        const rel = try std.fs.path.join(allocator, &.{ "repo", "SKILL.md" });
+        defer allocator.free(rel);
+        const f = try tmp.dir.createFile(rel, .{});
+        defer f.close();
+        try f.writeAll("# Git Skill\nInstalled from git.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
+    defer allocator.free(repo);
+
+    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+
+    try installSkillFromGit(allocator, repo, workspace, null);
+
+    const skills = try listSkills(allocator, workspace);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("git-install", skills[0].name);
+    try std.testing.expectEqualStrings("# Git Skill\nInstalled from git.", skills[0].instructions);
+}
+
+test "installSkillFromGit supports root markdown-only repository" {
+    const allocator = std.testing.allocator;
+    if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("repo");
+
+    {
+        const f = try tmp.dir.createFile("repo/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Root skill\nInstalled from root markdown.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
+    defer allocator.free(repo);
+
+    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "add", "SKILL.md" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+
+    try installSkillFromGit(allocator, repo, workspace, null);
+
+    const skills = try listSkills(allocator, workspace);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("repo", skills[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, skills[0].instructions, "Installed from root markdown.") != null);
+}
+
+test "installSkillFromGit installs all skills from repository skills directory" {
+    const allocator = std.testing.allocator;
+    if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("repo/skills/http_request");
+    try tmp.dir.makePath("repo/skills/review");
+
+    {
+        const f = try tmp.dir.createFile("repo/skills/http_request/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# HTTP Request\nFetch remote API responses.");
+    }
+    {
+        const f = try tmp.dir.createFile("repo/skills/review/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Review\nReview and audit code.");
+    }
+    {
+        const f = try tmp.dir.createFile("repo/README.md", .{});
+        defer f.close();
+        try f.writeAll("# Not a skill");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
+    defer allocator.free(repo);
+
+    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/http_request/SKILL.md", "skills/review/SKILL.md", "README.md" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+
+    try installSkillFromGit(allocator, repo, workspace, null);
+
+    const skills = try listSkills(allocator, workspace);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 2), skills.len);
+
+    var found_http = false;
+    var found_review = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "http_request")) {
+            found_http = true;
+            try std.testing.expect(std.mem.indexOf(u8, s.instructions, "Fetch remote API responses.") != null);
+        }
+        if (std.mem.eql(u8, s.name, "review")) {
+            found_review = true;
+            try std.testing.expect(std.mem.indexOf(u8, s.instructions, "Review and audit code.") != null);
+        }
+    }
+    try std.testing.expect(found_http);
+    try std.testing.expect(found_review);
+
+    const generated_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "http_request", "skill.json" });
+    defer allocator.free(generated_manifest);
+    const manifest = try std.fs.cwd().readFileAlloc(allocator, generated_manifest, 1024);
+    defer allocator.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"name\": \"http_request\"") != null);
+}
+
+test "installSkillFromGit installs SKILL.toml entry from repository skills directory" {
+    const allocator = std.testing.allocator;
+    if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("repo/skills/toml_only");
+
+    {
+        const f = try tmp.dir.createFile("repo/skills/toml_only/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "toml-only"
+            \\description = "marker-only entry"
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
+    defer allocator.free(repo);
+
+    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/toml_only/SKILL.toml" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+
+    try installSkillFromGit(allocator, repo, workspace, null);
+
+    const skills = try listSkills(allocator, workspace);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("toml_only", skills[0].name);
+
+    const generated_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "toml_only", "skill.json" });
+    defer allocator.free(generated_manifest);
+    const manifest = try std.fs.cwd().readFileAlloc(allocator, generated_manifest, 1024);
+    defer allocator.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"name\": \"toml_only\"") != null);
+}
+
+test "installSkillFromGit keeps full repo content when manifest name differs" {
+    const allocator = std.testing.allocator;
+    if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("repo/assets");
+
+    {
+        const f = try tmp.dir.createFile("repo/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"renamed-skill\", \"version\": \"1.0.0\"}");
+    }
+    {
+        const f = try tmp.dir.createFile("repo/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Renamed Skill\nUses assets.");
+    }
+    {
+        const f = try tmp.dir.createFile("repo/assets/payload.txt", .{});
+        defer f.close();
+        try f.writeAll("asset-data");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
+    defer allocator.free(repo);
+
+    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md", "assets/payload.txt" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+
+    try installSkillFromGit(allocator, repo, workspace, null);
+
+    const installed_skill_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "renamed-skill" });
+    defer allocator.free(installed_skill_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ installed_skill_path, "assets", "payload.txt" });
+    defer allocator.free(payload_path);
+
+    const payload = try std.fs.cwd().readFileAlloc(allocator, payload_path, 1024);
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings("asset-data", payload);
+
+    const old_clone_name_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "repo" });
+    defer allocator.free(old_clone_name_path);
+    try std.testing.expect(!pathExists(old_clone_name_path));
 }
 
 test "installSkillFromPath rejects missing manifest" {

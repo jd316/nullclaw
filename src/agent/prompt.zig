@@ -205,6 +205,19 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Do not claim attachment sending is unavailable when these markers are supported.\n\n");
 }
 
+fn writeXmlEscapedAttrValue(w: anytype, value: []const u8) !void {
+    for (value) |c| {
+        switch (c) {
+            '&' => try w.writeAll("&amp;"),
+            '<' => try w.writeAll("&lt;"),
+            '>' => try w.writeAll("&gt;"),
+            '"' => try w.writeAll("&quot;"),
+            '\'' => try w.writeAll("&apos;"),
+            else => try w.writeByte(c),
+        }
+    }
+}
+
 /// Append available skills with progressive loading.
 /// - always=true skills: full instruction text in the prompt
 /// - always=false skills: XML summary only (agent must use read_file to load)
@@ -272,18 +285,22 @@ fn appendSkillsSection(
             has_summary = true;
         }
         if (!skill.available) {
-            try std.fmt.format(
-                w,
-                "  <skill name=\"{s}\" description=\"{s}\" available=\"false\" missing=\"{s}\"/>\n",
-                .{ skill.name, skill.description, skill.missing_deps },
-            );
+            try w.writeAll("  <skill name=\"");
+            try writeXmlEscapedAttrValue(w, skill.name);
+            try w.writeAll("\" description=\"");
+            try writeXmlEscapedAttrValue(w, skill.description);
+            try w.writeAll("\" available=\"false\" missing=\"");
+            try writeXmlEscapedAttrValue(w, skill.missing_deps);
+            try w.writeAll("\"/>\n");
         } else {
             const skill_path = if (skill.path.len > 0) skill.path else workspace_dir;
-            try std.fmt.format(
-                w,
-                "  <skill name=\"{s}\" description=\"{s}\" path=\"{s}/SKILL.md\"/>\n",
-                .{ skill.name, skill.description, skill_path },
-            );
+            try w.writeAll("  <skill name=\"");
+            try writeXmlEscapedAttrValue(w, skill.name);
+            try w.writeAll("\" description=\"");
+            try writeXmlEscapedAttrValue(w, skill.description);
+            try w.writeAll("\" path=\"");
+            try writeXmlEscapedAttrValue(w, skill_path);
+            try w.writeAll("/SKILL.md\"/>\n");
         }
     }
     if (has_summary) {
@@ -590,6 +607,59 @@ test "appendSkillsSection renders summary XML for always=false skill" {
     try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") == null);
 }
 
+test "appendSkillsSection escapes XML attributes in summary output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/xml-escape");
+    {
+        const f = try tmp.dir.createFile("skills/xml-escape/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"xml-escape\", \"description\": \"Use \\\"quotes\\\" & <tags>\"}");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, base);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "&quot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "&amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "&lt;tags&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "description=\"Use \"quotes\" & <tags>\"") == null);
+}
+
+test "appendSkillsSection supports markdown-only installed skill" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/md-only");
+    {
+        const f = try tmp.dir.createFile("skills/md-only/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Markdown only skill");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, base);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "name=\"md-only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "path=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "md-only/SKILL.md") != null);
+}
+
 test "appendSkillsSection renders full instructions for always=true skill" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -742,6 +812,47 @@ test "appendSkillsSection unavailable always=true skill renders in XML not full"
     // Full instructions should NOT be in the prompt
     try std.testing.expect(std.mem.indexOf(u8, output, "These instructions should NOT appear in prompt.") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "### Skill: broken-always") == null);
+}
+
+test "installSkill end-to-end appears in buildSystemPrompt" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.makePath("source");
+
+    {
+        const f = try tmp.dir.createFile("source/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"e2e-installed-skill\", \"description\": \"Installed via installSkill\"}");
+    }
+    {
+        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Follow the installed skill instructions.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try skills_mod.installSkill(allocator, source, workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Available Skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "name=\"e2e-installed-skill\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "path=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "e2e-installed-skill/SKILL.md") != null);
 }
 
 test "buildSystemPrompt datetime appears before runtime" {
