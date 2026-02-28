@@ -303,28 +303,30 @@ fn downloadAndInstall(
 ) !void {
     std.debug.print("Downloading {s}...\n", .{asset_name});
 
-    const data = downloadWithRedirects(allocator, url) catch |err| {
-        log.err("Download failed: {}", .{err});
-        return error.DownloadFailed;
-    };
-    defer allocator.free(data);
-
-    if (data.len == 0) {
-        return error.EmptyDownload;
-    }
-
-    std.debug.print("Downloaded {d} bytes\n", .{data.len});
-
-    // Create temp file
+    // Create temp file first
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.partial", .{exe_path});
     defer allocator.free(tmp_path);
 
-    var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
     var tmp_closed = false;
     defer if (!tmp_closed) tmp_file.close();
 
-    // Write data
-    try tmp_file.writeAll(data);
+    // Download directly to file (streaming, no memory buffer limit)
+    const bytes_downloaded = downloadToFile(url, &tmp_file) catch |err| {
+        log.err("Download failed: {}", .{err});
+        // Clean up partial file on error
+        tmp_file.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return error.DownloadFailed;
+    };
+
+    if (bytes_downloaded == 0) {
+        tmp_file.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return error.EmptyDownload;
+    }
+
+    std.debug.print("Downloaded {d} bytes\n", .{bytes_downloaded});
 
     // Set executable permissions (Unix only)
     if (comptime builtin.os.tag != .windows) {
@@ -343,28 +345,66 @@ fn downloadAndInstall(
     std.debug.print("Installed successfully.\n", .{});
 }
 
-fn downloadWithRedirects(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-sfL", "--max-time", "60", url },
-    }) catch |err| {
-        log.err("curl failed: {}", .{err});
+/// Download a URL directly to a file using curl.
+/// Streams the data to avoid memory buffer limits.
+/// Returns the number of bytes downloaded.
+fn downloadToFile(url: []const u8, file: *std.fs.File) !usize {
+    const allocator = std.heap.page_allocator;
+
+    // Prepare argv
+    const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
+
+    // Initialize child process with stdout piped
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    // Spawn the child process
+    child.spawn() catch |err| {
+        log.err("curl spawn failed: {}", .{err});
         return error.CurlFailed;
     };
-    defer allocator.free(result.stderr);
 
-    switch (result.term) {
+    // Set up to read from child's stdout
+    const stdout = child.stdout.?;
+
+    // Copy data from curl stdout directly to file (streaming, no memory limit)
+    const buf_size = 64 * 1024; // 64KB buffer for streaming
+    var buffer: [buf_size]u8 = undefined;
+    var total_bytes: usize = 0;
+
+    while (true) {
+        const bytes_read = stdout.read(&buffer) catch |err| {
+            log.err("curl read failed: {}", .{err});
+            // Kill the child process since we're aborting
+            _ = child.kill() catch {};
+            return error.CurlFailed;
+        };
+
+        if (bytes_read == 0) break; // EOF
+
+        try file.writeAll(buffer[0..bytes_read]);
+        total_bytes += bytes_read;
+    }
+
+    // Wait for curl to exit and check exit code
+    const term = child.wait() catch |err| {
+        log.err("curl wait failed: {}", .{err});
+        return error.CurlFailed;
+    };
+
+    switch (term) {
         .Exited => |code| if (code != 0) {
-            allocator.free(result.stdout);
+            log.err("curl exited with code: {}", .{code});
             return error.CurlFailed;
         },
-        else => {
-            allocator.free(result.stdout);
+        .Signal, .Stopped, .Unknown => {
+            log.err("curl terminated abnormally: {}", .{term});
             return error.CurlFailed;
         },
     }
 
-    return result.stdout;
+    return total_bytes;
 }
 
 fn atomicReplace(tmp_path: []const u8, exe_path: []const u8) !void {
@@ -441,4 +481,39 @@ test "platformFromParts maps supported and unsupported targets" {
 
     try std.testing.expect(platformFromParts(.windows, .aarch64) == null);
     try std.testing.expect(platformFromParts(.freebsd, .x86_64) == null);
+}
+
+test "downloadToFile streams data without memory buffer limit" {
+    const allocator = std.testing.allocator;
+
+    // Create a temporary file for download
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = "test_download.bin";
+    var tmp_file = try tmp_dir.dir.createFile(tmp_path, .{ .read = true });
+    defer tmp_file.close();
+
+    // Download a small test file (using a reliable public URL)
+    // Using a GitHub API endpoint that returns JSON
+    const bytes_downloaded = downloadToFile(
+        "https://api.github.com/repos/nullclaw/nullclaw/releases/latest",
+        &tmp_file,
+    ) catch |err| {
+        // Skip test if network is unavailable
+        if (err == error.CurlFailed) return error.SkipZigTest;
+        return err;
+    };
+
+    // Verify we got some data
+    try std.testing.expect(bytes_downloaded > 0);
+
+    // Verify the file contains valid JSON (basic check)
+    try tmp_file.seekTo(0);
+    const content = try tmp_file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    // Should contain some JSON markers
+    try std.testing.expect(std.mem.indexOf(u8, content, "{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "tag_name") != null);
 }
