@@ -31,6 +31,7 @@ pub const channel_catalog = @import("channel_catalog.zig");
 pub const migration = @import("migration.zig");
 pub const sse_client = @import("sse_client.zig");
 pub const update = @import("update.zig");
+pub const ui = @import("ui.zig");
 pub const export_manifest = @import("export_manifest.zig");
 pub const list_models = @import("list_models.zig");
 pub const provider_probe = @import("provider_probe.zig");

@@ -33,6 +33,7 @@ const Command = enum {
     models,
     auth,
     update,
+    ui,
     help,
 };
 
@@ -58,6 +59,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "models", .models },
         .{ "auth", .auth },
         .{ "update", .update },
+        .{ "ui", .ui },
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
@@ -135,6 +137,7 @@ pub fn main() !void {
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
+        .ui => try runUi(allocator, sub_args),
     }
 }
 
@@ -2349,6 +2352,85 @@ fn runUpdate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     };
 }
 
+fn runUi(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printUiUsage();
+        std.process.exit(1);
+    }
+
+    const subcmd = sub_args[0];
+    if (std.mem.eql(u8, subcmd, "install")) {
+        if (sub_args.len != 1) {
+            std.debug.print("Usage: nullclaw ui install\n", .{});
+            std.process.exit(1);
+        }
+        yc.ui.runInstall(allocator) catch |err| {
+            std.debug.print("UI install failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "run")) {
+        yc.ui.runRun(allocator, sub_args[1..]) catch |err| {
+            std.debug.print("UI run failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "update")) {
+        var opts = yc.ui.UpdateOptions{ .check_only = false, .yes = false };
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--check")) {
+                opts.check_only = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--yes")) {
+                opts.yes = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
+                std.debug.print("Usage: nullclaw ui update [--check] [--yes]\n", .{});
+                std.process.exit(1);
+            }
+        }
+
+        yc.ui.runUpdate(allocator, opts) catch |err| {
+            std.debug.print("UI update failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "path")) {
+        if (sub_args.len != 1) {
+            std.debug.print("Usage: nullclaw ui path\n", .{});
+            std.process.exit(1);
+        }
+        yc.ui.runPath(allocator) catch |err| {
+            std.debug.print("UI path failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+
+    std.debug.print("Unknown ui command: {s}\n\n", .{subcmd});
+    printUiUsage();
+    std.process.exit(1);
+}
+
+fn printUiUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw ui <command> [args]
+        \\
+        \\Commands:
+        \\  install                   Download and install latest nullclaw-chat-ui release
+        \\  run [--host H] [--port P] Start nullclaw-chat-ui (auto-installs if missing)
+        \\  update [--check] [--yes]  Check or update installed nullclaw-chat-ui release
+        \\  path                      Show active installed nullclaw-chat-ui path
+        \\
+    , .{});
+}
+
 fn printAuthUsage() void {
     std.debug.print(
         \\Usage: nullclaw auth <command> <provider> [options]
@@ -2615,6 +2697,7 @@ fn printUsage() void {
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
         \\  update      Check for and install updates
+        \\  ui          Install/run/update nullclaw-chat-ui companion UI
         \\  help        Show this help
         \\
         \\OPTIONS:
@@ -2634,6 +2717,7 @@ fn printUsage() void {
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
         \\  update [--check] [--yes]
+        \\  ui <install|run|update|path> [ARGS]
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -2653,6 +2737,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
     try std.testing.expectEqual(.update, parseCommand("update").?);
+    try std.testing.expectEqual(.ui, parseCommand("ui").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
 }

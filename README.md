@@ -151,6 +151,10 @@ nullclaw channel start signal
 nullclaw service install
 nullclaw service status
 
+# Install and run companion web UI
+nullclaw ui install
+nullclaw ui run --host 127.0.0.1 --port 4173
+
 # Migrate memory from OpenClaw
 nullclaw migrate openclaw --dry-run
 nullclaw migrate openclaw
@@ -526,6 +530,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
 | `skills list\|install\|remove\|info` | Manage skill packs |
 | `hardware scan\|flash\|monitor` | Hardware device management |
 | `models list\|info\|benchmark` | Model catalog |
+| `ui install\|run\|update\|path` | Manage and launch `nullclaw-chat-ui` companion UI |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
 
 ## Development
